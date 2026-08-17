@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net10.0 because Titanium.Web.Proxy 5.x ships only a net10.0 target, and 5.x is where
+         WebSocket, HTTP/2 and HTTP/3 support lives. Retrofitting that later would mean redoing
+         the proxy layer, so the choice is made before anything is built on top of it. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>reqtree</AssemblyName>
+    <RootNamespace>ReqTree</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Warnings become errors so a nullability mistake is caught at build time rather than
+         becoming a null reference exception on a proxy thread later. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The MCP server is hosted in ASP.NET Core, which a plain console project does not
+         reference by default. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Scripts arrive from an LLM as C# source and have to be compiled at runtime. This is the
+         only runtime compilation in the project. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Scripting" Version="5.6.0" />
+    <!-- Only ever touched to save a capture or open a saved one. Nothing is written live. -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
+    <PackageReference Include="Serilog" Version="4.4.0" />
+    <!-- Titanium 5.x logs through Microsoft.Extensions.Logging. This adapter is what lets its
+         output land in ReqTree's log instead of in a second one of its own. -->
+    <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Titanium.Web.Proxy" Version="5.6.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+  </ItemGroup>
+
+</Project>

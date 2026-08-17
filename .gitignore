@@ -1,0 +1,11 @@
+bin/
+obj/
+*.user
+.vs/
+
+# Captures and dumps are data, not source. They also routinely contain real
+# credentials, so keeping them out of version control is a safety rule, not tidiness.
+*.reqtree
+*.db
+*.db-shm
+*.db-wal
