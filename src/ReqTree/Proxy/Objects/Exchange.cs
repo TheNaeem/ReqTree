@@ -44,7 +44,7 @@ public sealed class Exchange
     public byte[]? RequestBody
     {
         get => _requestBody;
-        set { _requestBody = value; _requestBodyText = null; }
+        set { _requestBody = value; _requestBodyText = null; _cachedRequestBody = null; }
     }
 
     private byte[]? _requestBody;
@@ -61,7 +61,7 @@ public sealed class Exchange
     public byte[]? ResponseBody
     {
         get => _responseBody;
-        set { _responseBody = value; _responseBodyText = null; }
+        set { _responseBody = value; _responseBodyText = null; _cachedResponseBody = null; }
     }
 
     private byte[]? _responseBody;
@@ -95,11 +95,45 @@ public sealed class Exchange
     private string? _requestBodyText;
     private string? _responseBodyText;
 
+    /// <summary>Which body the cached request text was decoded from. Null when nothing is cached.</summary>
+    private byte[]? _cachedRequestBody;
+
+    /// <summary>Which body the cached response text was decoded from. Null when nothing is cached.</summary>
+    private byte[]? _cachedResponseBody;
+
     /// <summary>Request body as text, or empty when absent or binary.</summary>
-    public string RequestBodyText => _requestBodyText ??= DecodeUtf8(RequestBody) ?? "";
+    public string RequestBodyText =>
+        BodyText(_requestBody, ref _requestBodyText, ref _cachedRequestBody);
 
     /// <summary>Response body as text, or empty when absent or binary.</summary>
-    public string ResponseBodyText => _responseBodyText ??= DecodeUtf8(ResponseBody) ?? "";
+    public string ResponseBodyText =>
+        BodyText(_responseBody, ref _responseBodyText, ref _cachedResponseBody);
+
+    /// <summary>
+    /// Decodes <paramref name="body"/> once and caches the result against that exact array.
+    /// </summary>
+    /// <remarks>
+    /// The cached text is only trusted when the body reference still matches the one it was decoded
+    /// from. A rule or script can replace a body on a proxy thread while a search reads its text on
+    /// another, and with a plain <c>??=</c> that race could leave the pre-rewrite text cached
+    /// indefinitely — the original body would stay findable through search_exchanges after a
+    /// redaction rule had already replaced it. Keying the cache to the body reference makes a stale
+    /// pair visible and forces a re-decode on the very next read.
+    /// </remarks>
+    private static string BodyText(byte[]? body, ref string? cachedText, ref byte[]? cachedBody)
+    {
+        var text = cachedText;
+        if (text is not null && ReferenceEquals(cachedBody, body))
+            return text;
+
+        var decoded = DecodeUtf8(body) ?? "";
+        cachedText = decoded;
+        cachedBody = body;
+        return decoded;
+    }
+
+    /// <summary>Built once: <see cref="Encoding.GetString"/> is thread-safe for reading.</summary>
+    private static readonly UTF8Encoding StrictUtf8 = new(false, throwOnInvalidBytes: true);
 
     /// <summary>
     /// Bytes as text, or null when they are not valid UTF-8.
@@ -116,7 +150,7 @@ public sealed class Exchange
 
         try
         {
-            return new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(body);
+            return StrictUtf8.GetString(body);
         }
         catch (DecoderFallbackException)
         {

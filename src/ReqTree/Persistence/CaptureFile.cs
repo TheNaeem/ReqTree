@@ -67,17 +67,32 @@ public static class CaptureFile
     public static int Save(ExchangeStore store, string path)
     {
         var exchanges = store.Snapshot();
+        var full = Path.GetFullPath(path);
 
         // Created rather than demanded. Asked to save to a folder that does not exist, SQLite
         // reports "unable to open database file" with no hint that the directory is the problem —
         // and the caller is usually an LLM relaying that to someone who cannot see the filesystem.
-        if (Path.GetDirectoryName(Path.GetFullPath(path)) is { Length: > 0 } directory)
+        if (Path.GetDirectoryName(full) is { Length: > 0 } directory)
             Directory.CreateDirectory(directory);
 
-        // Overwritten rather than appended to. A capture file is a snapshot of one store, and
-        // opening a half-overwritten one would be worse than refusing.
-        if (File.Exists(path)) File.Delete(path);
+        // Written to a sibling temp file and renamed into place, rather than deleting the old file
+        // and writing in place. Delete-then-write meant a failed or interrupted save destroyed the
+        // previous capture and left a half-written file in its place. A rename on the same volume is
+        // atomic, so the previous capture survives until the new one is fully written and committed.
+        var temp = full + ".tmp";
+        if (File.Exists(temp)) File.Delete(temp);
 
+        var written = WriteTo(exchanges, temp);
+
+        File.Move(temp, full, overwrite: true);
+
+        Log.Information("Saved {Count} exchange(s) to {Path}.", written, full);
+        return written;
+    }
+
+    /// <summary>Writes a snapshot to a new file, closing it before returning so it can be renamed.</summary>
+    private static int WriteTo(IReadOnlyList<Exchange> exchanges, string path)
+    {
         using var connection = Connect(path);
 
         using (var schema = connection.CreateCommand())
@@ -149,7 +164,6 @@ public static class CaptureFile
 
         transaction.Commit();
 
-        Log.Information("Saved {Count} exchange(s) to {Path}.", exchanges.Count, path);
         return exchanges.Count;
     }
 

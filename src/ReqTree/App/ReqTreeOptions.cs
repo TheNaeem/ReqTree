@@ -166,6 +166,39 @@ public class ReqTreeOptions
                 return false;
             }
 
+        // Every numeric flag, not just the ports. A value that does not parse ("--mcp-port=808o")
+        // or is out of range ("--buffer=-5", which would quietly mean "unlimited") is a usage error
+        // worth saying, not a fallback worth guessing at.
+        if (!ValidateNumber("--port", 1, 65535)
+            | !ValidateNumber("--mcp-port", 1, 65535)
+            | !ValidateNumber("--buffer", 0, int.MaxValue)
+            | !ValidateNumber("--buffer-mb", 0, int.MaxValue)
+            | !ValidateNumber("--stop-after", 0, int.MaxValue))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// True when <paramref name="flag"/> is absent, or present and a whole number within
+    /// <paramref name="min"/>..<paramref name="max"/>. Anything else is logged as a usage error.
+    /// </summary>
+    private bool ValidateNumber(string flag, int min, int max)
+    {
+        if (!_values.TryGetValue(flag, out var raw)) return true;
+
+        if (!long.TryParse(raw, out var parsed))
+        {
+            Log.Error("{Flag} takes a whole number, but got '{Raw}'.", flag, raw);
+            return false;
+        }
+
+        if (parsed < min || parsed > max)
+        {
+            Log.Error("{Flag} must be between {Min} and {Max}, but got {Value}.", flag, min, max, parsed);
+            return false;
+        }
+
         return true;
     }
 

@@ -80,6 +80,25 @@ public static class ControlTools
 
         if (!proxy.Stop())
         {
+            // "Already stopped" is only true when the settings went back too. Stop() returns false
+            // both when there is no listener and when an earlier stop failed to restore the system
+            // proxy — and in that second case the machine is still pointed at a dead port. Saying
+            // "nothing changed" there would be the same false-success claim Stop itself refuses to
+            // make.
+            if (proxy.IsSystemProxy)
+            {
+                Log.Error(
+                    "{Actor} called stop_proxy, but the machine's proxy settings could NOT be "
+                    + "restored and still point at port {Port}. Starting the proxy again and "
+                    + "stopping it, or restarting ReqTree, will repair it; the reason is in get_logs.",
+                    who, proxy.Port);
+
+                return "The proxy is stopped, but the machine's proxy settings could NOT be "
+                     + "restored and still point at ReqTree's port. Applications will lose "
+                     + "connectivity. Starting the proxy again and stopping it, or restarting "
+                     + "ReqTree, will repair it; the reason is in get_logs.";
+            }
+
             Log.Information("{Actor} called stop_proxy, but it was already stopped.", who);
             return "The proxy was already stopped. Nothing changed.";
         }
@@ -153,6 +172,10 @@ public static class ControlTools
         McpServer? mcpServer = null)
     {
         var who = Actor.Resolve(actor, mcpServer);
+
+        // Flattened before it is built into the condition and the logged description, for the same
+        // reason rule values are: a newline here would forge a line in the log.
+        when_value = Actor.Flatten(when_value);
 
         Func<Exchange, bool> condition;
 

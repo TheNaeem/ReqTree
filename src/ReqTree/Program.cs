@@ -77,11 +77,26 @@ try
         // A detached session: nothing is intercepted or recorded, the proxy is never started, and
         // the read tools are pointed at a saved capture instead of a live one.
         var file = options.OpenFile!;
+        var label = Path.GetFileNameWithoutExtension(file);
+
+        // Checked before the file is read, for the same reason the open_capture tool checks it: a
+        // blank or "live" label resolves back to the live capture, so a file opened under either
+        // name would be unreachable through every read tool.
+        if (label.Equals("live", StringComparison.OrdinalIgnoreCase))
+        {
+            Log.Error("'{0}' is the name of the live capture. Rename the file and open it again.", file);
+            return 1;
+        }
+
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            Log.Error("Could not work out a name for '{0}' - its file name is empty. Rename it.", file);
+            return 1;
+        }
 
         try
         {
             var opened = CaptureFile.Open(Path.GetFullPath(file));
-            var label = Path.GetFileNameWithoutExtension(file);
 
             proxy.AddOpenedCapture(label, opened);
             proxy.CaptureEnabled = false;

@@ -76,7 +76,9 @@ public static class ScriptTools
             "How long this script may run on one exchange, in milliseconds. Defaults to 5000. "
             + "Raise it for a script that legitimately does heavy work on large bodies. 0 means no "
             + "limit and runs the script inline - only use it if you are certain the code always "
-            + "returns, because an endless loop then holds that request open for good.")]
+            + "returns, because an endless loop then holds that request open for good. Note that "
+            + "even with 0, the install-time probe still uses the default 5000ms, so add_script "
+            + "itself cannot hang.")]
         int timeout_ms = 5000,
         [Description(Actor.Description)] string? actor = null,
         McpServer? mcpServer = null)
@@ -85,6 +87,11 @@ public static class ScriptTools
 
         if (string.IsNullOrWhiteSpace(script_name))
             return "A script needs a name, so that you and other sessions can refer to it later.";
+
+        // Flattened for the same reason rule names are: a newline in either reaches the log
+        // unfiltered and would forge a line that reads like a genuine entry.
+        script_name = Actor.Flatten(script_name);
+        if (environment is not null) environment = Actor.Flatten(environment);
 
         if (string.IsNullOrWhiteSpace(code))
             return "A script needs a body.";
@@ -141,6 +148,11 @@ public static class ScriptTools
             return $"Script '{script_name}' was still running after "
                  + $"{probeTimeout.TotalMilliseconds:F0}ms against a single sample exchange, so it "
                  + "was NOT added.\n\n"
+                 + (timeout_ms == 0
+                     ? "You passed timeout_ms=0 (no limit), but that applies to real traffic only; "
+                       + "the install-time probe still uses the default 5000ms so add_script cannot "
+                       + "hang.\n\n"
+                     : "")
                  + "That almost always means a loop with no way out. Every real request would have "
                  + "hit the same wall, so it is refused here rather than installed and disabled on "
                  + "the first piece of traffic.\n\n"
@@ -261,7 +273,7 @@ public static class ScriptTools
             return $"There is no script called '{script_name}'. Call list_scripts to see what is installed.";
 
         return $"{(enabled ? "Enabled" : "Disabled")} script '{script_name}' as {who}. "
-             + $"{proxy.Scripts.Count(s => s.Enabled)} of {proxy.Scripts.Count} script(s) are now enabled.";
+             + $"{proxy.AllScripts.Count(s => s.Script.Enabled)} of {proxy.AllScripts.Count} script(s) are now enabled.";
     }
 
     [McpServerTool(Name = "describe_script_format")]
@@ -336,7 +348,7 @@ public static class ScriptTools
         if (!proxy.RemoveScript(script_name, who))
             return $"There is no script called '{script_name}'. Call list_scripts to see what is installed.";
 
-        return $"Removed script '{script_name}' as {who}. {proxy.Scripts.Count} script(s) left.";
+        return $"Removed script '{script_name}' as {who}. {proxy.AllScripts.Count} script(s) left.";
     }
 
     /// <summary>

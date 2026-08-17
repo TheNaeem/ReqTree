@@ -65,6 +65,17 @@ public static class RuleTools
         if (string.IsNullOrWhiteSpace(rule_name))
             return "A rule needs a name, so that you and other sessions can refer to it later.";
 
+        // Flattened before anything is built from them. A newline in any of these would otherwise
+        // reach the log unfiltered and, because the file sink writes the message literally, forge a
+        // line that reads exactly like a genuine entry. Control characters have no meaning in a
+        // rule's name, match value, header or redirect, so this changes behaviour only for input
+        // that was nonsense anyway.
+        rule_name = Actor.Flatten(rule_name);
+        when_value = Actor.Flatten(when_value);
+        if (header_name is not null) header_name = Actor.Flatten(header_name);
+        if (header_value is not null) header_value = Actor.Flatten(header_value);
+        if (redirect_to is not null) redirect_to = Actor.Flatten(redirect_to);
+
         Func<Exchange, bool> condition;
 
         try

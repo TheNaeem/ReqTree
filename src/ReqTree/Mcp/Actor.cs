@@ -35,6 +35,17 @@ internal static class Actor
     }
 
     /// <summary>
+    /// Replaces control characters with spaces so a value can be written to the log without a
+    /// newline ending one line early and starting another that reads like a genuine entry. Unlike
+    /// <see cref="Clean"/>, this does not trim or cap — those stay the caller's choice.
+    /// </summary>
+    internal static string Flatten(string value)
+    {
+        if (!value.Any(char.IsControl)) return value;
+        return new string([.. value.Select(c => char.IsControl(c) ? ' ' : c)]);
+    }
+
+    /// <summary>
     /// Trims, flattens and caps a name before it reaches the log.
     /// </summary>
     /// <remarks>
@@ -47,7 +58,7 @@ internal static class Actor
     /// </remarks>
     internal static string Clean(string value)
     {
-        var flattened = new string([.. value.Trim().Select(c => char.IsControl(c) ? ' ' : c)]).Trim();
+        var flattened = Flatten(value.Trim()).Trim();
 
         if (flattened.Length == 0) return "unidentified";
 

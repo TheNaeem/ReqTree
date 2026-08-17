@@ -18,7 +18,11 @@ public static class ConsoleView
     {
         var status = exchange.StatusCode?.ToString() ?? "---";
         var duration = exchange.DurationMs is { } ms ? $"{ms,5:F0}ms" : "     -";
-        var size = exchange.ResponseBody?.Length ?? 0;
+
+        // Falls back to the server-reported size when the body was not stored (image, oversized,
+        // or an event stream), so a human watching a large download sees its real size rather than
+        // a misleading 0.
+        var size = exchange.ResponseBody is { } body ? (long)body.Length : exchange.ResponseSizeBytes;
 
         // Truncated so a URL with a page of query string cannot wrap and make the view unreadable.
         var url = Printable(exchange.Url);

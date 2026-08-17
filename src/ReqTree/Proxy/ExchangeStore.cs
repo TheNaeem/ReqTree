@@ -169,12 +169,20 @@ public sealed class ExchangeStore
             {
                 exchange.Id = ++_nextId;
             }
-            else if (exchange.Id <= _droppedWatermark)
+            else if (exchange.Id <= _droppedWatermark && exchange.HasResponse)
             {
-                // Below everything we have discarded, so this exchange was dropped to stay within
-                // the caps and its response is arriving afterwards. Refused rather than
-                // re-inserted: putting it back would place an old exchange at the young end of the
-                // age order and count it as a second arrival.
+                // Below everything we have discarded AND carrying a response, so its request half
+                // was dropped to stay within the caps (or deliberately cleared) and the response is
+                // arriving afterwards. Refused rather than re-inserted: putting it back would place
+                // an old exchange at the young end of the age order and count it as a second
+                // arrival.
+                //
+                // A request half is admitted even below the watermark. The proxy numbers exchanges
+                // at hook entry but calls AddExchange later, so under concurrency a low id can still
+                // be in flight while a higher one has already been dropped. Refusing that request
+                // half on the old "id <= watermark" test was silently losing traffic that had never
+                // been dropped. HasResponse is what tells the two apart: a response below the line
+                // is a ghost, a request below it is just late.
                 return false;
             }
             else

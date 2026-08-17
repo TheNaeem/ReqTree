@@ -298,6 +298,9 @@ public static class TrafficTools
             var full = Path.GetFullPath(path);
             var written = CaptureFile.Save(store, full);
 
+            Log.Information("{Actor} saved {Count} exchange(s) from {Capture} to {Path}.",
+                who, written, Name(capture), full);
+
             return $"Saved {written} exchange(s) from {Name(capture)} to {full} as {who}. "
                  + "Reopen it with open_capture or 'reqtree open'.";
         }
@@ -345,6 +348,9 @@ public static class TrafficTools
             var store = CaptureFile.Open(full);
             proxy.AddOpenedCapture(label, store);
 
+            Log.Information("{Actor} opened {Path} as '{Label}' ({Count} exchange(s)).",
+                who, full, label, store.Count);
+
             var stats = store.Stats();
 
             return $"Opened {full} as '{label}' for {who}: {store.Count} exchange(s) "
@@ -383,8 +389,12 @@ public static class TrafficTools
     [Description("Forget a capture opened from a file, freeing the memory it holds. The live capture cannot be closed.")]
     public static string CloseCapture(
         CaptureProxy proxy,
-        [Description("The name it was opened under.")] string name)
+        [Description("The name it was opened under.")] string name,
+        [Description(Actor.Description)] string? actor = null,
+        McpServer? mcpServer = null)
     {
+        var who = Actor.Resolve(actor, mcpServer);
+
         // Trimmed to match how open_capture stored it, so a name copied out of list_captures with
         // stray whitespace still finds its capture.
         name = name.Trim();
@@ -392,9 +402,11 @@ public static class TrafficTools
         if (name.Equals("live", StringComparison.OrdinalIgnoreCase))
             return "The live capture cannot be closed. Use stop_capture to stop recording into it.";
 
-        return proxy.CloseCapture(name)
-            ? $"Closed '{name}'."
-            : $"There is no open capture called '{name}'. Call list_captures to see what is open.";
+        if (!proxy.CloseCapture(name))
+            return $"There is no open capture called '{name}'. Call list_captures to see what is open.";
+
+        Log.Information("{Actor} closed capture '{Name}'.", who, name);
+        return $"Closed '{name}'.";
     }
 
     // -------------------------------------------------------------------------------------
@@ -505,6 +517,10 @@ public static class TrafficTools
                  + "response_headers, request_body, response_body or all.";
 
         var who = Actor.Resolve(actor, mcpServer);
+
+        // Flattened before it is matched against or logged: a newline here would forge a log line.
+        keyword = Actor.Flatten(keyword);
+
         var removed = store.RemoveMatching(keyword, where);
 
         Log.Warning("{Actor} cleared {Count} exchange(s) matching {Keyword} in {Where} from {Capture}.",

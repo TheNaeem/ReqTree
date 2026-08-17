@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
@@ -188,6 +189,14 @@ public sealed class CaptureProxy : IAsyncDisposable
     /// <see cref="Volatile.Read{T}"/> instead.
     /// </remarks>
     private CaptureWindow? _captureWindow;
+
+    /// <summary>
+    /// Id of the exchange that closed the last capture window, or zero. Recording stops the moment a
+    /// window closes, but that one exchange still gets its response half recorded — otherwise a
+    /// window armed on "the sign-in POST" captures the request and misses the token in the reply,
+    /// which is the very thing it was armed for.
+    /// </summary>
+    private long _windowClosingExchangeId;
 
     /// <summary>An armed stop condition, and what it was described as.</summary>
     public sealed record CaptureWindow(Func<Exchange, bool> StopWhen, string Description, string? ArmedBy);
@@ -401,12 +410,27 @@ public sealed class CaptureProxy : IAsyncDisposable
                     // code the crash-recovery path uses; Titanium's own RestoreOriginalProxySettings
                     // is deliberately not used, because it reports success even when it restores
                     // nothing, and one mechanism that is known to work beats two that might.
-                    RestoreSystemProxySettings(_originalSystemProxy);
-                    _systemProxyWasSet = false;
+                    //
+                    // It returns false rather than throwing when the registry key cannot be opened
+                    // for writing. That has to be treated exactly like a thrown failure: the
+                    // settings are still ours, the marker must survive for the next run, and the
+                    // message below must not claim a restore that did not happen.
+                    if (RestoreSystemProxySettings(_originalSystemProxy))
+                    {
+                        _systemProxyWasSet = false;
 
-                    // Cleared only after the restore succeeded, so the marker outliving us always
-                    // means the settings really are still ours.
-                    ClearProxyState();
+                        // Cleared only after the restore succeeded, so the marker outliving us always
+                        // means the settings really are still ours.
+                        ClearProxyState();
+                    }
+                    else
+                    {
+                        Log.Error(
+                            "Could not restore the machine's proxy settings. They still point at "
+                            + "ReqTree on port {Port}, so applications will lose connectivity when "
+                            + "this process exits. Starting ReqTree again will repair it, or set "
+                            + "them back by hand in Internet Options.", Port);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1125,14 +1149,22 @@ public sealed class CaptureProxy : IAsyncDisposable
         ApplyBehaviour(exchange, ProxyHook.BeforeRequest);
 
         // Again, so the record shows what ReqTree actually did rather than what the client sent.
-        // AddExchange recognises the id from the first call and updates in place.
-        if (_captureEnabled) Capture.AddExchange(exchange);
+        // AddExchange recognises the id from the first call and updates in place. The closing
+        // exchange of a capture window is recorded here too, even though recording has just been
+        // switched off — a window armed on a request that is then answered locally has its mock
+        // response only at this point.
+        if (_captureEnabled || Interlocked.Read(ref _windowClosingExchangeId) == exchange.Id)
+            Capture.AddExchange(exchange);
 
         // A response set during the request hook means "answer this yourself" - the request never
         // goes upstream. That is how block and mock work without a separate concept for either.
         if (exchange.StatusCode is not null)
         {
             exchange.CompletedAt ??= DateTimeOffset.Now;
+
+            // There is no server to report a size here, so the mock's own body length is the honest
+            // one. Left unset it stays zero, which reads as "empty response" next to a real body.
+            exchange.ResponseSizeBytes = exchange.ResponseBody?.Length ?? 0;
 
             var headers = new List<HttpHeader>
             {
@@ -1277,8 +1309,13 @@ public sealed class CaptureProxy : IAsyncDisposable
         // The same exchange, now with its response half. AddExchange recognises it by the id it was
         // given on the way in and updates rather than filing the request a second time. It refuses
         // if the request half was dropped to stay within the caps, which is correct — half an
-        // exchange, with a response and no request, is worse than none.
-        if (_captureEnabled) Capture.AddExchange(exchange);
+        // exchange, with a response and no request, is worse than none. The exchange that closed a
+        // capture window is recorded here even though recording is now off, so its response is kept.
+        if (_captureEnabled || Interlocked.Read(ref _windowClosingExchangeId) == exchange.Id)
+        {
+            Capture.AddExchange(exchange);
+            Interlocked.Exchange(ref _windowClosingExchangeId, 0);
+        }
 
         if (exchange.StatusCode != originalStatus && exchange.StatusCode is { } status)
         {
@@ -1345,6 +1382,7 @@ public sealed class CaptureProxy : IAsyncDisposable
         if (Interlocked.CompareExchange(ref _captureWindow, null, window) != window) return;
 
         _captureEnabled = false;
+        Interlocked.Exchange(ref _windowClosingExchangeId, exchange.Id);
 
         Log.Information(
             "Capture window armed by {Actor} closed on {Method} {Url} (exchange {Id}): "
@@ -1580,14 +1618,19 @@ public sealed class CaptureProxy : IAsyncDisposable
         try
         {
             var marker = new ProxyStateMarker(
-                System.Environment.ProcessId, DateTimeOffset.Now, Port, original.Enable, original.Server);
+                System.Environment.ProcessId,
+                new DateTimeOffset(System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime()),
+                Port, original.Enable, original.Server);
 
             File.WriteAllText(DirectoryManager.ProxyStateFilePath, JsonSerializer.Serialize(marker));
         }
-        catch (IOException ex)
+        catch (Exception ex)
         {
             // Failing to write the marker is not worth refusing to start over. It costs only the
-            // automatic cleanup on the next run, not anything about this one.
+            // automatic cleanup on the next run, not anything about this one. A broad catch is
+            // deliberate: WriteAllText can fail with UnauthorizedAccessException or
+            // NotSupportedException as well as IOException, and none of them is a reason to tear
+            // down a proxy that is already running.
             Log.Warning("Could not record proxy state: {Reason}", ex.Message);
         }
     }
@@ -1626,7 +1669,7 @@ public sealed class CaptureProxy : IAsyncDisposable
             // first is still running.
             if (marker.ProcessId == System.Environment.ProcessId) return null;
 
-            return IsProcessRunning(marker.ProcessId) ? null : marker;
+            return IsMarkerProcessAlive(marker) ? null : marker;
         }
         catch (Exception ex) when (ex is IOException or JsonException)
         {
@@ -1636,13 +1679,23 @@ public sealed class CaptureProxy : IAsyncDisposable
         }
     }
 
-    /// <summary>True when a process with this id is still alive.</summary>
-    private static bool IsProcessRunning(int processId)
+    /// <summary>
+    /// True when the process that wrote the marker is still alive.
+    /// </summary>
+    /// <remarks>
+    /// The id alone is not enough: Windows reuses process ids, so <see cref="Process.GetProcessById"/>
+    /// can succeed for a different process long after the one that wrote the marker is gone. The
+    /// recorded start time is what tells them apart — it never matches across two processes. When it
+    /// cannot be read (for example an elevated process), the safe answer is "still alive": repairing
+    /// the settings against a ReqTree that is actually running would be the worse mistake.
+    /// </remarks>
+    private static bool IsMarkerProcessAlive(ProxyStateMarker marker)
     {
         try
         {
-            using var process = System.Diagnostics.Process.GetProcessById(processId);
-            return !process.HasExited;
+            using var process = System.Diagnostics.Process.GetProcessById(marker.ProcessId);
+            return !process.HasExited
+                && process.StartTime.ToUniversalTime() == marker.StartedAt.UtcDateTime;
         }
         catch (ArgumentException)
         {
@@ -1651,7 +1704,13 @@ public sealed class CaptureProxy : IAsyncDisposable
         }
         catch (InvalidOperationException)
         {
+            // Exited between the lookup and the start-time read.
             return false;
+        }
+        catch (Win32Exception)
+        {
+            // A process is there but its start time is unreadable. Assume it is still ours.
+            return true;
         }
     }
 }
