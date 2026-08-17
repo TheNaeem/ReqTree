@@ -58,7 +58,8 @@ public static class ScriptTools
         + "Example: if (exchange.Url.Contains(\"/track\")) { exchange.StatusCode = 204; "
         + "exchange.ResponseBody = Array.Empty<byte>(); }\n\n"
         + "Scripts are not sandboxed. What is guaranteed is only that one that throws cannot "
-        + "break traffic - it is caught, logged, and the next one runs.")]
+        + "break traffic - it is caught, logged, and the next one runs - and that one which never "
+        + "returns is abandoned after timeout_ms instead of holding the request open forever.")]
     public static async Task<string> AddScript(
         CaptureProxy proxy,
         [Description("A short name for this script. Reused to remove it, and appears in every log line it produces.")]
@@ -71,6 +72,12 @@ public static class ScriptTools
             "Group this script into a named environment, so it can be enabled, disabled or "
             + "removed together with everything else carrying that name.")]
         string? environment = null,
+        [Description(
+            "How long this script may run on one exchange, in milliseconds. Defaults to 5000. "
+            + "Raise it for a script that legitimately does heavy work on large bodies. 0 means no "
+            + "limit and runs the script inline - only use it if you are certain the code always "
+            + "returns, because an endless loop then holds that request open for good.")]
+        int timeout_ms = 5000,
         [Description(Actor.Description)] string? actor = null,
         McpServer? mcpServer = null)
     {
@@ -81,6 +88,10 @@ public static class ScriptTools
 
         if (string.IsNullOrWhiteSpace(code))
             return "A script needs a body.";
+
+        if (timeout_ms < 0)
+            return "timeout_ms cannot be negative. Use 0 for no limit, or leave it out for the "
+                 + "default of 5000.";
 
         ProxyHook target;
 
@@ -118,10 +129,28 @@ public static class ScriptTools
 
         // Proved to run before it is installed, so a script that throws on its very first call
         // fails here, where the session can see it, rather than on a request it cannot observe.
-        var probe = await ProbeAsync(runner, target);
-        if (probe is not null)
+        // A script with no timeout still gets probed against one. Otherwise "no limit" would mean
+        // add_script never returns, which is not a trade anyone would choose knowingly.
+        var probeTimeout = timeout_ms > 0
+            ? TimeSpan.FromMilliseconds(timeout_ms)
+            : Script.DefaultTimeout;
+
+        var probe = await ProbeAsync(runner, target, probeTimeout);
+
+        if (probe.TimedOut)
+            return $"Script '{script_name}' was still running after "
+                 + $"{probeTimeout.TotalMilliseconds:F0}ms against a single sample exchange, so it "
+                 + "was NOT added.\n\n"
+                 + "That almost always means a loop with no way out. Every real request would have "
+                 + "hit the same wall, so it is refused here rather than installed and disabled on "
+                 + "the first piece of traffic.\n\n"
+                 + "The thread running it cannot be stopped and will use CPU until ReqTree is "
+                 + "restarted - so fix the loop rather than retrying with a bigger timeout_ms, "
+                 + "unless the script genuinely needs longer than this on one exchange.";
+
+        if (probe.Error is { } failure)
             return $"Script '{script_name}' compiled but threw when run against a sample "
-                 + $"exchange, so it was not added: {probe}\n\n"
+                 + $"exchange, so it was not added: {failure}\n\n"
                  + "The sample is a POST to http://reqtree.invalid/probe?sample=1 with a Host and "
                  + "Content-Type header and a small JSON body"
                  + (target is ProxyHook.BeforeResponse
@@ -136,10 +165,11 @@ public static class ScriptTools
             Hook = target,
             AddedBy = who,
             Source = code,
+            Timeout = TimeSpan.FromMilliseconds(timeout_ms),
 
-            // Run inline on the proxy thread rather than handed to the thread pool. A script is
-            // ordinary synchronous code, so the await completes immediately; queueing it would
-            // mean concurrent requests both waiting on pool threads that are themselves waiting.
+            // The delegate itself is synchronous: a script is ordinary code, so this await completes
+            // without ever yielding. Whether it is given a thread of its own is the proxy's decision,
+            // made from Timeout, not this one's.
             Run = exchange => runner(new ScriptGlobals { exchange = exchange })
                 .GetAwaiter().GetResult(),
         }, string.IsNullOrWhiteSpace(environment) ? null : environment.Trim());
@@ -153,8 +183,13 @@ public static class ScriptTools
             ? "It is standalone, so it runs after every environment."
             : $"It belongs to environment '{environment.Trim()}', which runs first.";
 
+        var limit = timeout_ms == 0
+            ? " It has NO timeout and runs inline, so a loop that cannot exit will hold every "
+              + "request open until ReqTree is restarted."
+            : $" It is abandoned and disabled if one exchange takes it longer than {timeout_ms}ms.";
+
         return $"{(replaced ? "Replaced" : "Added")} script '{script_name}' as {who}, on "
-             + $"{hook}. {where} {onHook} script(s) run at that hook, after all rules.{warning}";
+             + $"{hook}. {where} {onHook} script(s) run at that hook, after all rules.{limit}{warning}";
     }
 
     [McpServerTool(Name = "list_scripts")]
@@ -181,7 +216,12 @@ public static class ScriptTools
                 && proxy.Environments.FirstOrDefault(e =>
                     e.Name.Equals(environment, StringComparison.OrdinalIgnoreCase)) is { Enabled: false };
 
-            var state = !script.Enabled ? " (disabled)"
+            // Being disabled by a timeout is said as its own thing. "Disabled" alone reads like
+            // somebody turned it off, and the next session would simply switch it back on and hit
+            // the same runaway loop again.
+            var state = script.TimeoutCount > 0 && !script.Enabled
+                    ? " (DISABLED - it ran past its timeout and was abandoned)"
+                : !script.Enabled ? " (disabled)"
                 : inactive ? " (enabled, but its environment is disabled, so it does not run)"
                 : "";
 
@@ -190,7 +230,11 @@ public static class ScriptTools
                 + (environment is null ? " [standalone]" : $" [environment: {environment}]")
                 + $" on {script.Hook} - "
                 + $"added by {script.AddedBy ?? "unidentified"} at {script.AddedAt:HH:mm:ss}, "
-                + $"ran {script.RunCount} time(s), threw {script.ErrorCount} time(s).");
+                + $"ran {script.RunCount} time(s), threw {script.ErrorCount} time(s)"
+                + (script.TimeoutCount > 0 ? $", timed out {script.TimeoutCount} time(s)" : "")
+                + (script.Timeout <= TimeSpan.Zero
+                    ? ", no timeout."
+                    : $", timeout {script.Timeout.TotalMilliseconds:F0}ms."));
 
             if (script.Source is { } source)
                 report.AppendLine($"      {source.ReplaceLineEndings(" ")}");
@@ -307,7 +351,8 @@ public static class ScriptTools
     /// makes reasonable code look broken.
     /// </remarks>
     /// <returns>The failure, or null when it ran cleanly.</returns>
-    private static async Task<string?> ProbeAsync(ScriptRunner<object> runner, ProxyHook hook)
+    private static async Task<ProbeResult> ProbeAsync(
+        ScriptRunner<object> runner, ProxyHook hook, TimeSpan timeout)
     {
         var sample = new Exchange
         {
@@ -333,14 +378,31 @@ public static class ScriptTools
             sample.ResponseSizeBytes = 15;
         }
 
-        try
+        Exception? thrown = null;
+
+        var work = Task.Run(async () =>
         {
-            await runner(new ScriptGlobals { exchange = sample });
-            return null;
-        }
-        catch (Exception ex)
-        {
-            return $"{ex.GetType().Name}: {ex.Message}";
-        }
+            try
+            {
+                await runner(new ScriptGlobals { exchange = sample });
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+        });
+
+        // Raced against a delay rather than awaited. Without this an endless loop hangs add_script
+        // itself: the tool call never returns, and the session that made it is stuck with no error
+        // and nothing to read. Catching it here is also strictly better than catching it at
+        // request time — the script is refused instead of installed and then disabled on the first
+        // piece of real traffic.
+        if (await Task.WhenAny(work, Task.Delay(timeout)) != work)
+            return new ProbeResult(TimedOut: true, Error: null);
+
+        return new ProbeResult(false, thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}");
     }
+
+    /// <summary>How the sample run went.</summary>
+    private sealed record ProbeResult(bool TimedOut, string? Error);
 }

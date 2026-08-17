@@ -294,16 +294,28 @@ public sealed class CaptureProxy : IAsyncDisposable
                 // user points their client at us manually; capture works identically either way.
                 if (_registerAsSystemProxy && OperatingSystem.IsWindows())
                 {
-                    // Read before the takeover, or what we record is our own settings and the
-                    // recovery path faithfully restores the broken state.
-                    _originalSystemProxy = ReadSystemProxySettings();
+                    if (TryClaimSystemProxyOwnership())
+                    {
+                        // Read before the takeover, or what we record is our own settings and the
+                        // recovery path faithfully restores the broken state.
+                        _originalSystemProxy = ReadSystemProxySettings();
 
-                    server.SetAsSystemProxy(endPoint, ProxyProtocolType.AllHttp);
-                    _systemProxyWasSet = true;
+                        server.SetAsSystemProxy(endPoint, ProxyProtocolType.AllHttp);
+                        _systemProxyWasSet = true;
 
-                    // Written immediately after taking over, so a crash between here and shutdown
-                    // still leaves enough behind for the next run to undo it.
-                    RecordProxyState(_originalSystemProxy);
+                        // Written immediately after taking over, so a crash between here and
+                        // shutdown still leaves enough behind for the next run to undo it.
+                        RecordProxyState(_originalSystemProxy);
+                    }
+                    else
+                    {
+                        Log.Warning(
+                            "Another ReqTree already owns this machine's proxy settings, so this one "
+                            + "is listening on port {Port} without touching them. Point a client "
+                            + "here yourself, or stop the other one first. Taking over would record "
+                            + "ITS port as the setting to restore, and whichever of us stopped last "
+                            + "would leave the machine pointed at a dead port.", Port);
+                    }
                 }
 
                 _proxyServer = server;
@@ -336,6 +348,11 @@ public sealed class CaptureProxy : IAsyncDisposable
                             + "again will repair them.", Port);
                     }
                 }
+
+                // Unconditional: the claim may have been taken and the takeover then failed before
+                // _systemProxyWasSet was ever set, and holding it after a failed start would lock
+                // every later run of this process out of the settings it never touched.
+                ReleaseSystemProxyOwnership();
 
                 // Whatever was half-built has to go, or the next attempt inherits a server that
                 // already holds the endpoint and fails for a second, more confusing reason.
@@ -407,6 +424,10 @@ public sealed class CaptureProxy : IAsyncDisposable
                         + "by hand in Internet Options.", Port);
                 }
             }
+
+            // Given up whether or not the restore worked. If it failed the marker is still there and
+            // the next run repairs it, and that run needs to be able to claim ownership to do so.
+            ReleaseSystemProxyOwnership();
 
             var wasRunning = server.ProxyRunning;
             if (wasRunning) server.Stop();
@@ -489,6 +510,11 @@ public sealed class CaptureProxy : IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         Stop();
+
+        // Stop releases it on the path where a proxy was running. This catches the other one: a
+        // process that claimed ownership, failed somewhere odd, and is now going away holding it.
+        ReleaseSystemProxyOwnership();
+
         return ValueTask.CompletedTask;
     }
 
@@ -791,7 +817,28 @@ public sealed class CaptureProxy : IAsyncDisposable
 
             try
             {
-                script.Run(exchange);
+                if (!RunWithinTimeout(script, exchange))
+                {
+                    // Disabled, not merely skipped. The thread running it cannot be stopped — .NET
+                    // has no way to interrupt code that will not yield — so the only thing that can
+                    // be prevented is the next request starting another one. One leaked thread is
+                    // survivable; one per request is not.
+                    script.Enabled = false;
+                    script.RecordTimeout();
+
+                    Log.Error(
+                        "Script {Script} (added by {Actor}) did not finish within {Timeout} on "
+                        + "{Hook} for {Method} {Url} (exchange {Id}), so it has been DISABLED and "
+                        + "the request carried on without it. The thread it left behind cannot be "
+                        + "stopped and will use CPU until it returns on its own — if it never does, "
+                        + "restart ReqTree. Check the script for a loop that cannot exit; fix it and "
+                        + "add it again, or pass a longer timeout_ms if it genuinely needs one.",
+                        script.Name, script.AddedBy ?? "unidentified", script.Timeout,
+                        hook, exchange.Method, exchange.Url, exchange.Id);
+
+                    continue;
+                }
+
                 script.RecordRun();
 
                 Log.Information(
@@ -818,6 +865,55 @@ public sealed class CaptureProxy : IAsyncDisposable
                     exchange.Method, exchange.Url, script.ErrorCount);
             }
         }
+    }
+
+    /// <summary>
+    /// Runs a script, giving up on it if it takes longer than its timeout.
+    /// </summary>
+    /// <remarks>
+    /// A timeout cannot cancel the script — nothing in .NET can interrupt arbitrary code that does
+    /// not cooperate, and the APIs that once claimed to (Thread.Abort) are gone for good reasons. So
+    /// what this buys is narrower than it looks, and worth being exact about: the *request* stops
+    /// waiting. Traffic keeps flowing, the exchange is recorded, and the caller is not left hanging
+    /// on a loop that will never end.
+    ///
+    /// Anything the script throws is re-thrown on this thread so the existing handler reports it
+    /// with the script's name, exactly as it did when scripts ran inline.
+    ///
+    /// A zero timeout runs inline instead. That is not just an escape hatch for someone who trusts
+    /// their own code — it also skips the thread-pool hop, which is real cost on a path that runs
+    /// for every request.
+    /// </remarks>
+    /// <returns>False when it ran out of time.</returns>
+    private static bool RunWithinTimeout(Script script, Exchange exchange)
+    {
+        if (script.Timeout <= TimeSpan.Zero)
+        {
+            script.Run(exchange);
+            return true;
+        }
+
+        Exception? thrown = null;
+
+        var work = Task.Run(() =>
+        {
+            try
+            {
+                script.Run(exchange);
+            }
+            catch (Exception ex)
+            {
+                // Captured rather than left to fault the task: an unobserved faulted task is a
+                // finalizer-thread crash waiting to happen, and the timeout path never awaits it.
+                thrown = ex;
+            }
+        });
+
+        if (!work.Wait(script.Timeout)) return false;
+
+        if (thrown is not null) throw thrown;
+
+        return true;
     }
 
     /// <summary>
@@ -1396,6 +1492,85 @@ public sealed class CaptureProxy : IAsyncDisposable
         {
             // Nothing to notify. The registry write already happened, which is the part that lasts,
             // and this must never be the reason a restore is reported as having failed.
+        }
+    }
+
+    /// <summary>
+    /// Name of the machine-wide claim on the system proxy settings. Session-scoped, because the
+    /// settings it guards live in HKCU and are per-login.
+    /// </summary>
+    private const string SystemProxyOwnershipName = @"Local\ReqTree.SystemProxyOwner";
+
+    /// <summary>Held for as long as this process owns the machine's proxy settings.</summary>
+    private Semaphore? _systemProxyOwnership;
+
+    /// <summary>
+    /// Claims the right to change the machine's proxy settings, or reports that someone else has it.
+    /// </summary>
+    /// <remarks>
+    /// Two ReqTrees started together used to corrupt the settings between them, and the failure was
+    /// delayed and confusing. The first records the real original and points the machine at itself.
+    /// The second then reads *that* as the original — proxy on, pointing at the first one's port —
+    /// and faithfully restores it on the way out. Whichever stops last wins, and if that is the
+    /// second, the machine is left pointing at a port nothing is listening on. The user sees the
+    /// internet stop working, long after the thing that broke it.
+    ///
+    /// A named semaphore rather than a mutex: a mutex belongs to the thread that took it and must be
+    /// released by that same thread, and here it is claimed on whichever thread called TryStart and
+    /// released on whichever one calls Stop. A semaphore has no such affinity. When the owner dies
+    /// its handle closes with it, and once the last handle is gone the kernel object goes too — so a
+    /// crash frees the claim rather than blocking every future run.
+    /// </remarks>
+    private bool TryClaimSystemProxyOwnership()
+    {
+        if (_systemProxyOwnership is not null) return true;
+
+        try
+        {
+            var claim = new Semaphore(initialCount: 1, maximumCount: 1, name: SystemProxyOwnershipName);
+
+            if (!claim.WaitOne(TimeSpan.Zero))
+            {
+                claim.Dispose();
+                return false;
+            }
+
+            _systemProxyOwnership = claim;
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException
+                or PlatformNotSupportedException)
+        {
+            // Cannot arbitrate. Carrying on is the lesser evil: refusing here would stop a single,
+            // perfectly ordinary ReqTree from working at all, to guard against a second one that
+            // usually is not there. Said out loud so it is not a silent loss of protection.
+            Log.Warning(ex,
+                "Could not check whether another ReqTree owns the system proxy settings, so this "
+                + "one is proceeding as though it does not. If two are running, stopping them in "
+                + "the wrong order can leave the machine pointed at a dead port.");
+
+            return true;
+        }
+    }
+
+    /// <summary>Gives up the claim, once the settings have actually been put back.</summary>
+    private void ReleaseSystemProxyOwnership()
+    {
+        var claim = Interlocked.Exchange(ref _systemProxyOwnership, null);
+        if (claim is null) return;
+
+        try
+        {
+            claim.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // Already released. Nothing to undo, and not worth reporting.
+        }
+        finally
+        {
+            claim.Dispose();
         }
     }
 

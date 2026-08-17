@@ -238,6 +238,30 @@ ids not restarting after a clear, and every bad argument. Two failures on the fi
 harness reading the count out of `get_stats`, whose empty-capture reply now also mentions how many
 were cleared — the tools were right both times.
 
+## Two bugs found by someone else using it (2026-08-17)
+
+Both reported by a first outside user, and both were things every test here had missed because the
+tests only ever ran one ReqTree and only ever wrote scripts that terminate.
+
+**Two instances corrupted the system proxy between them.** The first records the real original and
+points the machine at itself; the second reads that as *its* original and restores it on exit. Stop
+them in that order and the machine is left aimed at a dead port — the user sees the internet stop
+working, long after the thing that broke it. Fixed with a named semaphore, `TryClaimSystemProxyOwnership`.
+
+**Scripts had no time limit.** `while (true)` held the request open forever, and every subsequent
+request started another copy. Fixed in two places, because the runtime fix alone was not enough: the
+`add_script` probe also had no timeout, so a runaway script hung the tool call itself and the
+session that made it got no answer at all. Now the probe refuses it, and anything that gets past the
+probe is abandoned and disabled on the first overrun. Default 5s, `timeout_ms` to override, `0` for
+none.
+
+What cannot be fixed: the runaway thread. .NET cannot interrupt code that will not yield. Disabling
+the script is the whole of the mitigation, and the log says so plainly rather than implying the
+thread was stopped.
+
+Two harnesses, both mutation-checked against the pre-fix build in `publish/`: the race test failed
+6 checks there and left the machine pointing at a dead port, and restored it afterwards either way.
+
 ## Next
 
 - WebSocket capture — the library supports it and nothing else does this well.

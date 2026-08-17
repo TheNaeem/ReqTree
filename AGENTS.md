@@ -69,6 +69,20 @@ the user should conclude? Expose the data and let the LLM do it.
   says so explicitly. Assigning is also what clears the decoded-text cache on `Exchange` — mutate a
   body array in place and `RequestBodyText` keeps returning the old contents, which once meant a
   redacted body was still findable through `search_exchanges`.
+- **Only one ReqTree may own the system proxy, and a named semaphore enforces it.** Two started
+  together used to corrupt the settings between them: the first records the real original and points
+  the machine at itself, the second then reads *that* as the original and faithfully restores it on
+  the way out, leaving the machine aimed at a port nothing is listening on. The second instance now
+  stands down and says so. The semaphore is `Local\ReqTree.SystemProxyOwner`, and it is a semaphore
+  rather than a mutex because a mutex must be released by the thread that took it — here it is
+  claimed in `TryStart` and released in `Stop`, which are routinely different threads.
+- **A script that never returns cannot be killed, so it is refused or disabled instead.** .NET has
+  no way to interrupt code that will not yield, and `Thread.Abort` is gone. So `while (true)` is
+  handled in two places: `add_script` probes every script against a sample exchange under a timeout
+  and refuses one that overruns, and at request time `RunWithinTimeout` gives up waiting and
+  **disables** the script. Disabling is the point — one leaked thread is survivable, one per request
+  is what takes the machine down. Default five seconds, `timeout_ms` overrides it, and `0` means run
+  inline with no limit for someone who is sure.
 - **Clearing advances the dropped watermark, and has to.** The four `clear_*` tools remove
   exchanges deliberately. A response normally arrives as a second `AddExchange` for an exchange
   whose request half is already stored — remove that half and the response is no longer recognised,
