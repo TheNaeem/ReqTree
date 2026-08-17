@@ -69,6 +69,13 @@ the user should conclude? Expose the data and let the LLM do it.
   says so explicitly. Assigning is also what clears the decoded-text cache on `Exchange` — mutate a
   body array in place and `RequestBodyText` keeps returning the old contents, which once meant a
   redacted body was still findable through `search_exchanges`.
+- **Clearing advances the dropped watermark, and has to.** The four `clear_*` tools remove
+  exchanges deliberately. A response normally arrives as a second `AddExchange` for an exchange
+  whose request half is already stored — remove that half and the response is no longer recognised,
+  so it would be filed as a new exchange holding a response and no request. Every removal path
+  moves `_droppedWatermark` past what it took, which is what refuses it. Cleared exchanges are
+  counted in `Cleared`, never in `Dropped`: that number means "the caps are biting", and an empty
+  capture reporting hundreds recorded and none dropped reads like a bug that is not there.
 - **The buffer is bounded and drops the oldest.** `--buffer`, `--buffer-mb` and `--stop-after` are
   enforced by `ExchangeStore`; a store built with no arguments is unbounded, which is what an opened
   capture file gets so that loading one cannot silently discard half of it. Dropping is never

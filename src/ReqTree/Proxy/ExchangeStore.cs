@@ -69,6 +69,7 @@ public sealed class ExchangeStore
     private long _approximateBytes;
     private long _totalSeen;
     private long _dropped;
+    private long _cleared;
     private bool _stopped;
 
     /// <summary>Most exchanges held before the oldest are dropped. Zero means no limit.</summary>
@@ -109,6 +110,16 @@ public sealed class ExchangeStore
 
     /// <summary>How many have been dropped to stay within the caps.</summary>
     public long Dropped { get { lock (_sync) return _dropped; } }
+
+    /// <summary>
+    /// How many have been removed deliberately, by one of the clearing methods.
+    /// </summary>
+    /// <remarks>
+    /// Counted apart from <see cref="Dropped"/> so a reader can tell "the caps are biting" from
+    /// "somebody threw these away". Without it, a store holding nothing after a clear would report
+    /// hundreds recorded and none dropped, which reads like exchanges went missing on their own.
+    /// </remarks>
+    public long Cleared { get { lock (_sync) return _cleared; } }
 
     /// <summary>True once a limit has stopped recording.</summary>
     public bool StoppedByLimit { get { lock (_sync) return _stopped; } }
@@ -326,6 +337,120 @@ public sealed class ExchangeStore
                 return true;
 
         return false;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Clearing. Deliberate removal, as against Trim's automatic dropping to stay inside the
+    // caps — the same four ways in as the queries above, so anything that can be found can be
+    // thrown away on the same terms.
+    //
+    // All of them advance the dropped watermark past whatever they removed. A response usually
+    // arrives on the second AddExchange for an exchange whose request half is already stored;
+    // remove that half and the response would no longer be recognised, and would be filed as a
+    // brand new exchange holding a response and no request. The watermark is what refuses it.
+    // -------------------------------------------------------------------------------------
+
+    /// <summary>Removes everything held. Returns how many went.</summary>
+    /// <remarks>
+    /// <see cref="TotalSeen"/> and the <c>--stop-after</c> limit are deliberately left alone: they
+    /// describe the session, not the contents, and a store stopped by its limit stays stopped.
+    /// </remarks>
+    public int Clear()
+    {
+        lock (_sync)
+        {
+            var removed = _order.Count;
+            if (removed == 0) return 0;
+
+            // Everything numbered so far, not merely everything held — after a full clear there is
+            // nothing left that a late response could legitimately belong to.
+            _droppedWatermark = Math.Max(_droppedWatermark, _nextId);
+
+            _order.Clear();
+            _byId.Clear();
+            _approximateBytes = 0;
+            _cleared += removed;
+
+            return removed;
+        }
+    }
+
+    /// <summary>Removes the <paramref name="count"/> oldest exchanges.</summary>
+    public int RemoveOldest(int count) => RemoveFromOneEnd(count, oldest: true);
+
+    /// <summary>Removes the <paramref name="count"/> newest exchanges.</summary>
+    public int RemoveNewest(int count) => RemoveFromOneEnd(count, oldest: false);
+
+    private int RemoveFromOneEnd(int count, bool oldest)
+    {
+        if (count <= 0) return 0;
+
+        lock (_sync)
+        {
+            var removed = 0;
+
+            while (removed < count && _order.Count > 0)
+            {
+                RemoveNode(oldest ? _order.First! : _order.Last!);
+                removed++;
+            }
+
+            _cleared += removed;
+            return removed;
+        }
+    }
+
+    /// <summary>Removes every exchange <see cref="Search"/> would return for these arguments.</summary>
+    public int RemoveMatching(string keyword, SearchIn where)
+    {
+        if (string.IsNullOrEmpty(keyword)) return 0;
+
+        // Matched outside the lock, through Search, for the reason the class comment gives: deciding
+        // whether a body contains a keyword can mean decoding every body held, and traffic arriving
+        // must not queue behind that. Ids are then removed under the lock, and any that has gone in
+        // the meantime is simply not found.
+        return RemoveByIds([.. Search(keyword, where).Select(exchange => exchange.Id)]);
+    }
+
+    /// <summary>Removes exchanges that started more than <paramref name="minutes"/> ago.</summary>
+    public int RemoveOlderThan(double minutes)
+    {
+        var cutoff = DateTimeOffset.Now.AddMinutes(-Math.Abs(minutes));
+        return RemoveByIds([.. Snapshot().Where(e => e.StartedAt < cutoff).Select(e => e.Id)]);
+    }
+
+    private int RemoveByIds(IReadOnlyList<long> ids)
+    {
+        if (ids.Count == 0) return 0;
+
+        lock (_sync)
+        {
+            var removed = 0;
+
+            foreach (var id in ids)
+                if (_byId.TryGetValue(id, out var node))
+                {
+                    RemoveNode(node);
+                    removed++;
+                }
+
+            _cleared += removed;
+            return removed;
+        }
+    }
+
+    /// <summary>
+    /// Unlinks one entry and gives back what it was charged. Only ever called with the lock held,
+    /// and never counts towards <see cref="Dropped"/> — every caller is a deliberate removal.
+    /// </summary>
+    private void RemoveNode(LinkedListNode<Entry> node)
+    {
+        var entry = node.Value;
+
+        _order.Remove(node);
+        _byId.Remove(entry.Exchange.Id);
+        _approximateBytes -= entry.AccountedBytes;
+        _droppedWatermark = Math.Max(_droppedWatermark, entry.Exchange.Id);
     }
 
     /// <summary>A summary of what is held, for the stats tool.</summary>

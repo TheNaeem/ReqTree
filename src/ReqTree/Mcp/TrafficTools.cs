@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 using ReqTree.Persistence;
 using ReqTree.Proxy;
 using ReqTree.Proxy.Objects;
+using Serilog;
 
 namespace ReqTree.Mcp;
 
@@ -100,20 +101,9 @@ public static class TrafficTools
 
         if (string.IsNullOrEmpty(keyword)) return "keyword cannot be empty.";
 
-        ExchangeStore.SearchIn where;
-
-        switch (search_in.Trim().ToLowerInvariant())
-        {
-            case "url": where = ExchangeStore.SearchIn.Url; break;
-            case "request_headers": where = ExchangeStore.SearchIn.RequestHeaders; break;
-            case "response_headers": where = ExchangeStore.SearchIn.ResponseHeaders; break;
-            case "request_body": where = ExchangeStore.SearchIn.RequestBody; break;
-            case "response_body": where = ExchangeStore.SearchIn.ResponseBody; break;
-            case "all": where = ExchangeStore.SearchIn.All; break;
-            default:
-                return $"'{search_in}' is not somewhere I can search. Use url, request_headers, "
-                     + "response_headers, request_body, response_body or all.";
-        }
+        if (ParseSearchIn(search_in) is not { } where)
+            return $"'{search_in}' is not somewhere I can search. Use url, request_headers, "
+                 + "response_headers, request_body, response_body or all.";
 
         var found = store.Search(keyword, where);
 
@@ -187,6 +177,9 @@ public static class TrafficTools
         if (stats.Total == 0)
 
             return $"{Name(capture)} is empty. "
+                 + (store.Cleared > 0
+                     ? $"{store.Cleared} exchange(s) were removed with the clear tools. "
+                     : "")
                  + (proxy.CaptureEnabled
                      ? "Recording is on, so either nothing has gone through yet or the proxy is stopped."
                      : "Recording is off - call start_capture.");
@@ -248,7 +241,12 @@ public static class TrafficTools
             + $". {store.TotalSeen} recorded in total"
             + (store.Dropped > 0
                 ? $", of which {store.Dropped} were DROPPED as the oldest to stay within the caps."
-                : ", none dropped."));
+                : ", none dropped.")
+            // Otherwise a capture emptied on purpose reads as one that lost its contents by itself,
+            // and the next move is to go hunting for a bug that is not there.
+            + (store.Cleared > 0
+                ? $" {store.Cleared} were removed deliberately by one of the clear tools."
+                : ""));
 
         if (proxy.ArmedWindow is { } window)
             report.AppendLine($"Capture window: armed by {window.ArmedBy ?? "unidentified"} - "
@@ -400,9 +398,193 @@ public static class TrafficTools
     }
 
     // -------------------------------------------------------------------------------------
+    // Clearing. The same four ways of choosing exchanges the read tools offer, because the
+    // question "which ones do I mean" is the same question either way. There is no undo: the
+    // capture is memory, so what these remove is gone unless save_capture was called first.
+    // -------------------------------------------------------------------------------------
+
+    private const string ClearWarning =
+        "This cannot be undone - the capture lives in memory, so anything removed is gone unless "
+        + "save_capture was called first.";
+
+    [McpServerTool(Name = "clear_all_exchanges")]
+    [Description(
+        "Remove every exchange from a capture, leaving it empty and ready to record a clean run. "
+        + "Recording and the proxy are left exactly as they are, so traffic arriving next is kept. "
+        + "Use this to get a clean slate before reproducing something, rather than restarting "
+        + "ReqTree. " + ClearWarning)]
+    public static string ClearAllExchanges(
+        CaptureProxy proxy,
+        [Description(CaptureDescription)] string? capture = null,
+        [Description(Actor.Description)] string? actor = null,
+        McpServer? mcpServer = null)
+    {
+        if (proxy.ResolveCapture(capture) is not { } store) return NoSuchCapture(proxy, capture);
+
+        var who = Actor.Resolve(actor, mcpServer);
+        var removed = store.Clear();
+
+        Log.Warning("{Actor} cleared all {Count} exchange(s) from {Capture}.",
+            who, removed, Name(capture));
+
+        return removed == 0
+            ? $"{Name(capture)} was already empty. Nothing was removed."
+            : $"Removed all {removed} exchange(s) from {Name(capture)} as {who}. " + Recording(proxy, capture);
+    }
+
+    [McpServerTool(Name = "clear_exchanges_by_count")]
+    [Description(
+        "Remove a number of exchanges from one end: the oldest, to prune what has piled up, or the "
+        + "newest, to undo a run you have just made and try again. " + ClearWarning)]
+    public static string ClearExchangesByCount(
+        CaptureProxy proxy,
+        [Description("How many to remove. More than are held removes everything.")] int count,
+        [Description("Which end to take them from: 'oldest' or 'newest'. Defaults to oldest.")]
+        string from = "oldest",
+        [Description(CaptureDescription)] string? capture = null,
+        [Description(Actor.Description)] string? actor = null,
+        McpServer? mcpServer = null)
+    {
+        if (proxy.ResolveCapture(capture) is not { } store) return NoSuchCapture(proxy, capture);
+
+        if (count <= 0) return "count must be greater than zero.";
+
+        bool oldest;
+
+        switch (from.Trim().ToLowerInvariant())
+        {
+            case "oldest": case "front": case "start": oldest = true; break;
+            case "newest": case "back": case "end": oldest = false; break;
+            default:
+                return $"'{from}' is not an end I can take from. Use 'oldest' or 'newest'.";
+        }
+
+        var who = Actor.Resolve(actor, mcpServer);
+        var held = store.Count;
+        var removed = oldest ? store.RemoveOldest(count) : store.RemoveNewest(count);
+
+        Log.Warning("{Actor} cleared the {Count} {End} exchange(s) from {Capture}; {Left} left.",
+            who, removed, oldest ? "oldest" : "newest", Name(capture), store.Count);
+
+        if (removed == 0)
+            return $"{Name(capture)} is empty, so there was nothing to remove.";
+
+        // Said when it happened, because "remove 500" against 300 held is a different outcome from
+        // the one asked for, and the caller should not have to infer it from the count.
+        var short_ = removed < count
+            ? $" That was all of them - only {held} were held, fewer than the {count} asked for."
+            : "";
+
+        return $"Removed the {removed} {(oldest ? "oldest" : "newest")} exchange(s) from "
+             + $"{Name(capture)} as {who}.{short_} {store.Count} remain.";
+    }
+
+    [McpServerTool(Name = "clear_exchanges_matching")]
+    [Description(
+        "Remove every exchange a search would find - same keyword and same places to look as "
+        + "search_exchanges. Use it to drop noise you do not care about, such as a CDN host or a "
+        + "telemetry endpoint, so what is left is the flow you are actually reading. Run "
+        + "search_exchanges with the same arguments first to see exactly what will go. " + ClearWarning)]
+    public static string ClearExchangesMatching(
+        CaptureProxy proxy,
+        [Description("The text to look for. Every exchange containing it is removed.")] string keyword,
+        [Description(
+            "Where to look: url, request_headers, response_headers, request_body, response_body, "
+            + "or all. Defaults to url, which is the one that matches what you meant most often.")]
+        string search_in = "url",
+        [Description(CaptureDescription)] string? capture = null,
+        [Description(Actor.Description)] string? actor = null,
+        McpServer? mcpServer = null)
+    {
+        if (proxy.ResolveCapture(capture) is not { } store) return NoSuchCapture(proxy, capture);
+
+        if (string.IsNullOrEmpty(keyword)) return "keyword cannot be empty.";
+
+        if (ParseSearchIn(search_in) is not { } where)
+            return $"'{search_in}' is not somewhere I can search. Use url, request_headers, "
+                 + "response_headers, request_body, response_body or all.";
+
+        var who = Actor.Resolve(actor, mcpServer);
+        var removed = store.RemoveMatching(keyword, where);
+
+        Log.Warning("{Actor} cleared {Count} exchange(s) matching {Keyword} in {Where} from {Capture}.",
+            who, removed, keyword, search_in, Name(capture));
+
+        return removed == 0
+            ? $"Nothing in {Name(capture)} matched '{keyword}' in {search_in}, so nothing was "
+              + $"removed. {store.Count} still held."
+            : $"Removed {removed} exchange(s) matching '{keyword}' in {search_in} from "
+              + $"{Name(capture)} as {who}. {store.Count} remain.";
+    }
+
+    [McpServerTool(Name = "clear_exchanges_older_than")]
+    [Description(
+        "Remove exchanges that started more than N minutes ago, keeping only the recent window. "
+        + "The mirror of get_exchanges_since: that one shows you the last N minutes, this one "
+        + "throws away everything before them. Fractions are fine. " + ClearWarning)]
+    public static string ClearExchangesOlderThan(
+        CaptureProxy proxy,
+        [Description("Exchanges that started further back than this many minutes are removed.")]
+        double minutes,
+        [Description(CaptureDescription)] string? capture = null,
+        [Description(Actor.Description)] string? actor = null,
+        McpServer? mcpServer = null)
+    {
+        if (proxy.ResolveCapture(capture) is not { } store) return NoSuchCapture(proxy, capture);
+
+        if (minutes <= 0)
+            return "minutes must be greater than zero. To remove everything, call clear_all_exchanges.";
+
+        var who = Actor.Resolve(actor, mcpServer);
+        var removed = store.RemoveOlderThan(minutes);
+
+        Log.Warning("{Actor} cleared {Count} exchange(s) older than {Minutes} minute(s) from {Capture}.",
+            who, removed, minutes, Name(capture));
+
+        return removed == 0
+            ? $"Nothing in {Name(capture)} was older than {minutes} minute(s), so nothing was "
+              + $"removed. {store.Count} still held."
+            : $"Removed {removed} exchange(s) older than {minutes} minute(s) from {Name(capture)} "
+              + $"as {who}. {store.Count} remain.";
+    }
+
+    /// <summary>
+    /// What happens next, said after a capture is emptied. An LLM clearing to start a clean run
+    /// needs to know whether the run will actually be recorded, and the two switches are separate.
+    /// </summary>
+    private static string Recording(CaptureProxy proxy, string? capture)
+    {
+        if (!string.IsNullOrWhiteSpace(capture) && !capture.Equals("live", StringComparison.OrdinalIgnoreCase))
+            return "That capture was read from a file, so nothing will refill it.";
+
+        if (!proxy.CaptureEnabled)
+            return "Recording is OFF, so it will stay empty until start_capture is called.";
+
+        return proxy.IsRunning
+            ? "Recording is on and the proxy is intercepting, so new traffic will land here."
+            : "Recording is on, but the proxy is STOPPED, so nothing will arrive until start_proxy.";
+    }
+
+    // -------------------------------------------------------------------------------------
 
     private static string Name(string? capture) =>
         string.IsNullOrWhiteSpace(capture) ? "the live capture" : $"capture '{capture}'";
+
+    /// <summary>
+    /// The <c>search_in</c> argument, or null if it names nowhere. Shared by searching and
+    /// clearing so the two cannot come to accept different words for the same place.
+    /// </summary>
+    private static ExchangeStore.SearchIn? ParseSearchIn(string search_in) =>
+        search_in.Trim().ToLowerInvariant() switch
+        {
+            "url" => ExchangeStore.SearchIn.Url,
+            "request_headers" => ExchangeStore.SearchIn.RequestHeaders,
+            "response_headers" => ExchangeStore.SearchIn.ResponseHeaders,
+            "request_body" => ExchangeStore.SearchIn.RequestBody,
+            "response_body" => ExchangeStore.SearchIn.ResponseBody,
+            "all" => ExchangeStore.SearchIn.All,
+            _ => null,
+        };
 
     private static string NoSuchCapture(CaptureProxy proxy, string? capture)
     {

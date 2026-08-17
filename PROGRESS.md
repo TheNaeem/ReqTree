@@ -219,7 +219,28 @@ path never reaches:
 - If recording is turned off between a request and its response, the response is still recorded (the
   store holds the same object) but its bytes are not charged against the buffer ceiling.
 
+## Clearing (added 2026-08-17)
+
+Four tools, mirroring the four ways the read tools select exchanges, because "which ones do I
+mean" is the same question whether you are reading them or throwing them away:
+`clear_all_exchanges`, `clear_exchanges_by_count` (oldest or newest), `clear_exchanges_matching`
+(same keyword and `search_in` as `search_exchanges`), `clear_exchanges_older_than`. 36 tools now.
+
+Two things fell out of building it and are worth keeping in mind:
+
+- Removal has to advance the dropped watermark, or a response arriving for an exchange whose
+  request half was just cleared comes back as a response-only ghost. `AGENTS.md` has the detail.
+- `Cleared` is counted separately from `Dropped`. Folding them together would have made every
+  deliberately emptied capture look like one that had silently lost its contents.
+
+Covered by a seventh harness (26 checks): both ends, over-large counts, keyword and age selection,
+ids not restarting after a clear, and every bad argument. Two failures on the first run were the
+harness reading the count out of `get_stats`, whose empty-capture reply now also mentions how many
+were cleared — the tools were right both times.
+
 ## Next
 
 - WebSocket capture — the library supports it and nothing else does this well.
-- Nothing has ever been committed to git. `git init` has been run; there are no commits.
+- There is still no way to clear an opened (file-backed) capture other than `close_capture`, which
+  is almost certainly the right trade — but the `clear_*` tools do accept a `capture` argument, so
+  the asymmetry is now visible where it was not before.
