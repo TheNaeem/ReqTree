@@ -79,17 +79,29 @@ are done: **“Save this capture as `example-sign-in`.”**
 One capture proves only the path you performed. Capture extra flows deliberately for other roles,
 errors, device checks, or permissions before asking the LLM to broaden the implementation.
 
-### Modify traffic with a plain-language request
+### Example modifications
 
-For simple changes, ask directly. For example, while testing your own site, say:
+While testing a site you are authorized to modify, ask directly. For example:
 
 > **“For requests to `api.example.com`, add the request header `X-Test-Mode: true`. Keep capturing
 > so I can see the result, and tell me how to undo the change.”**
 
-The LLM can create a matching rule and later disable or remove it. You can ask for other bounded
-changes in the same way: block an analytics host, redirect a test endpoint, redact a request field,
-or mock a known endpoint with a test response. For conditional or computed changes, ask it to write
-a script; ReqTree can run one before a request leaves or before a response reaches the client.
+The LLM can create a matching rule and later disable or remove it. Other useful prompts include:
+
+- **Request body:** “For `POST` requests to `api.example.com/orders`, replace the JSON field
+  `testMode` with `true`. Capture the original request and tell me which exchanges changed.”
+- **URL redirect:** “Redirect requests from `https://api.example.com/v1/catalog` to
+  `https://staging-api.example.com/v1/catalog` until I tell you to stop.”
+- **Response body:** “For responses from `api.example.com/feature-flags`, return a version with
+  `newCheckout` set to `true`, but keep the original upstream response in the capture.”
+- **Mock response:** “Mock `GET https://api.example.com/account` with a `200` JSON response for a
+  test user, without sending the request upstream.”
+- **Block traffic:** “Block requests to `analytics.example.com` and log every match.”
+
+For conditional or computed changes, the LLM can generate a custom C# script and pass it to ReqTree
+for you. ReqTree runs that script before a request leaves or before a response reaches the client.
+For example: **“Write and enable a script that adds `X-Preview: true` only when a request URL
+contains `/preview/`; log each change and show me the script first.”**
 
 ## Commands
 
