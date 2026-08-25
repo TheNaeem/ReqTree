@@ -138,3 +138,19 @@ land in the same file as everything else.
 
 Related trap: `builder.Logging.AddFilter(...)` on the ASP.NET pipeline does **not** reach Serilog's
 sinks. Host verbosity is controlled by `MinimumLevel.Override` in `App/Logging.cs`.
+
+### Timed scripts use bounded isolated runners
+
+Scripts with a timeout run on bounded long-running runners over a private exchange snapshot. A
+timed-out script cannot be interrupted, so it must not retain the live exchange or consume the
+shared thread pool after the request has carried on. A script with `timeout_ms=0` remains inline;
+the install-time probe has its own finite cap for the same reason.
+
+### CaptureProxy is a façade over concrete internal modules
+
+The proxy lifecycle remains the public shape MCP tools use, but its four coupled concerns own their
+state internally: `CapturePipeline` for Titanium hook sequencing, `ScriptRuntime` for bounded script
+execution, `CaptureCatalog` for live and file-backed capture names, and `SystemProxyLease` for the
+Windows registry, marker, and semaphore. They are concrete classes, not hypothetical interfaces:
+there is one SQLite implementation and one Windows system-proxy mechanism, so an abstraction would
+only hide the behavior callers need to understand.

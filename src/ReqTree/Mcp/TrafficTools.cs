@@ -329,24 +329,26 @@ public static class TrafficTools
         {
             var full = Path.GetFullPath(path);
 
-            var label = string.IsNullOrWhiteSpace(name)
-                ? Path.GetFileNameWithoutExtension(full)
-                : name.Trim();
+            var resolvedName = proxy.ResolveOpenedCaptureName(full, name);
 
-            if (label.Equals("live", StringComparison.OrdinalIgnoreCase))
+            if (resolvedName.Problem is CaptureNameProblem.LiveReserved)
                 return "'live' is the name of the capture being recorded now. Pick another.";
 
             // A blank label resolves back to the live capture, because that is what an omitted
             // 'capture' argument means. Left unchecked, a file called ".reqtree" would report as
             // opened and then every read against it would quietly serve live traffic instead.
-            if (string.IsNullOrWhiteSpace(label))
+            if (resolvedName.Problem is CaptureNameProblem.Empty)
                 return $"Could not work out a name for {full} — its file name is empty. "
                      + "Pass an explicit name.";
+
+            var label = resolvedName.Value!;
 
             // Opened only once the name is known to be usable, so a rejected call has not spent
             // time and memory reading a file it is about to refuse.
             var store = CaptureFile.Open(full);
-            proxy.AddOpenedCapture(label, store);
+            if (!proxy.AddOpenedCapture(label, store))
+                return $"A capture called '{label}' is already open. Pick another name or close "
+                     + "the existing capture first.";
 
             Log.Information("{Actor} opened {Path} as '{Label}' ({Count} exchange(s)).",
                 who, full, label, store.Count);

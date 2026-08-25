@@ -79,15 +79,34 @@ public static class CaptureFile
         // and writing in place. Delete-then-write meant a failed or interrupted save destroyed the
         // previous capture and left a half-written file in its place. A rename on the same volume is
         // atomic, so the previous capture survives until the new one is fully written and committed.
-        var temp = full + ".tmp";
-        if (File.Exists(temp)) File.Delete(temp);
+        // A unique sibling prevents two MCP sessions saving to the same destination from deleting
+        // each other's temp file. The final move still replaces the destination atomically; the
+        // last completed save wins, but neither save can report success with a half-written file.
+        var temp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
-        var written = WriteTo(exchanges, temp);
+        try
+        {
+            var written = WriteTo(exchanges, temp);
+            File.Move(temp, full, overwrite: true);
 
-        File.Move(temp, full, overwrite: true);
-
-        Log.Information("Saved {Count} exchange(s) to {Path}.", written, full);
-        return written;
+            Log.Information("Saved {Count} exchange(s) to {Path}.", written, full);
+            return written;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temp)) File.Delete(temp);
+            }
+            catch (IOException)
+            {
+                // The original save failure is more useful to the caller than cleanup noise.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Same: a leftover uniquely named temp file cannot corrupt a later save.
+            }
+        }
     }
 
     /// <summary>Writes a snapshot to a new file, closing it before returning so it can be renamed.</summary>

@@ -151,11 +151,7 @@ public sealed class ExchangeStore
                 // Already here. The response half usually arrives on the same object, but this
                 // stays correct if a caller hands back a different one carrying the same id.
                 // The charge comes off at what it was recorded as, not at what the object now says.
-                _approximateBytes -= held.Value.AccountedBytes;
-
-                held.Value.Exchange = exchange;
-                held.Value.AccountedBytes = BodyBytes(exchange);
-                _approximateBytes += held.Value.AccountedBytes;
+                UpdateHeld(held, exchange);
 
                 // A response body is often what pushes the store over its ceiling, so the caps have
                 // to be applied on update as well as on insert.
@@ -202,6 +198,32 @@ public sealed class ExchangeStore
 
             return true;
         }
+    }
+
+    /// <summary>
+    /// Updates an exchange already held without admitting a new one. Used when recording was
+    /// turned off between the request and response: the request half remains visible, but a
+    /// response arriving later must not create a new exchange just because its object was copied.
+    /// </summary>
+    public bool UpdateExisting(Exchange exchange)
+    {
+        lock (_sync)
+        {
+            if (exchange.Id == 0 || !_byId.TryGetValue(exchange.Id, out var held))
+                return false;
+
+            UpdateHeld(held, exchange);
+            Trim();
+            return true;
+        }
+    }
+
+    private void UpdateHeld(LinkedListNode<Entry> held, Exchange exchange)
+    {
+        _approximateBytes -= held.Value.AccountedBytes;
+        held.Value.Exchange = exchange;
+        held.Value.AccountedBytes = BodyBytes(exchange);
+        _approximateBytes += held.Value.AccountedBytes;
     }
 
     /// <summary>

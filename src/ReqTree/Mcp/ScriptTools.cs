@@ -5,6 +5,7 @@ using Microsoft.CodeAnalysis.Scripting;
 using ModelContextProtocol.Server;
 using ReqTree.Proxy;
 using ReqTree.Proxy.Objects;
+using Serilog;
 
 // Roslyn has a Script type of its own, and this file mentions both. Ours is the one worth the
 // short name here, since it is what the tools actually build.
@@ -142,9 +143,21 @@ public static class ScriptTools
             ? TimeSpan.FromMilliseconds(timeout_ms)
             : Script.DefaultTimeout;
 
-        var probe = await ProbeAsync(runner, target, probeTimeout);
+        var probe = await ScriptRuntime.ProbeAsync(
+            exchange => runner(new ScriptGlobals { exchange = exchange }), target, probeTimeout);
+
+        if (probe.Rejection is { } rejection)
+            return rejection;
 
         if (probe.TimedOut)
+        {
+            Log.Error(
+                "Script {Script} (added by {Actor}) timed out during its install-time probe on "
+                + "{Hook} after {Timeout}. Inspect the script for an infinite loop, blocking wait, "
+                + "or async operation that never completes before trying again; list_scripts shows "
+                + "the source.",
+                script_name, who, target, probeTimeout);
+
             return $"Script '{script_name}' was still running after "
                  + $"{probeTimeout.TotalMilliseconds:F0}ms against a single sample exchange, so it "
                  + "was NOT added.\n\n"
@@ -159,6 +172,7 @@ public static class ScriptTools
                  + "The thread running it cannot be stopped and will use CPU until ReqTree is "
                  + "restarted - so fix the loop rather than retrying with a bigger timeout_ms, "
                  + "unless the script genuinely needs longer than this on one exchange.";
+        }
 
         if (probe.Error is { } failure)
             return $"Script '{script_name}' compiled but threw when run against a sample "
@@ -351,70 +365,4 @@ public static class ScriptTools
         return $"Removed script '{script_name}' as {who}. {proxy.AllScripts.Count} script(s) left.";
     }
 
-    /// <summary>
-    /// Runs a freshly compiled script once against a throwaway exchange shaped like the one it
-    /// will really see.
-    /// </summary>
-    /// <remarks>
-    /// The shape matters. A before_response script reading <c>exchange.ResponseHeaders</c> is
-    /// ordinary and correct, but against a request-shaped sample that property is null and the
-    /// script throws — so a working script would be rejected for a fault in the test rather than
-    /// in itself. The sample carries a header and a small body for the same reason: an empty one
-    /// makes reasonable code look broken.
-    /// </remarks>
-    /// <returns>The failure, or null when it ran cleanly.</returns>
-    private static async Task<ProbeResult> ProbeAsync(
-        ScriptRunner<object> runner, ProxyHook hook, TimeSpan timeout)
-    {
-        var sample = new Exchange
-        {
-            StartedAt = DateTimeOffset.Now.AddMilliseconds(-20),
-            Method = "POST",
-            Url = "http://reqtree.invalid/probe?sample=1",
-            Host = "reqtree.invalid",
-            Path = "/probe",
-            QueryString = "?sample=1",
-            HttpVersion = "1.1",
-            RequestHeaders = [("Host", "reqtree.invalid"), ("Content-Type", "application/json")],
-            RequestContentType = "application/json",
-            RequestBody = """{"sample":true}"""u8.ToArray(),
-        };
-
-        if (hook is ProxyHook.BeforeResponse)
-        {
-            sample.CompletedAt = DateTimeOffset.Now;
-            sample.StatusCode = 200;
-            sample.ResponseHeaders = [("Content-Type", "application/json"), ("Content-Length", "15")];
-            sample.ResponseContentType = "application/json";
-            sample.ResponseBody = """{"sample":true}"""u8.ToArray();
-            sample.ResponseSizeBytes = 15;
-        }
-
-        Exception? thrown = null;
-
-        var work = Task.Run(async () =>
-        {
-            try
-            {
-                await runner(new ScriptGlobals { exchange = sample });
-            }
-            catch (Exception ex)
-            {
-                thrown = ex;
-            }
-        });
-
-        // Raced against a delay rather than awaited. Without this an endless loop hangs add_script
-        // itself: the tool call never returns, and the session that made it is stuck with no error
-        // and nothing to read. Catching it here is also strictly better than catching it at
-        // request time — the script is refused instead of installed and then disabled on the first
-        // piece of real traffic.
-        if (await Task.WhenAny(work, Task.Delay(timeout)) != work)
-            return new ProbeResult(TimedOut: true, Error: null);
-
-        return new ProbeResult(false, thrown is null ? null : $"{thrown.GetType().Name}: {thrown.Message}");
-    }
-
-    /// <summary>How the sample run went.</summary>
-    private sealed record ProbeResult(bool TimedOut, string? Error);
 }

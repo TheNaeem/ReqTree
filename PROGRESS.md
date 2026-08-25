@@ -268,3 +268,25 @@ Two harnesses, both mutation-checked against the pre-fix build in `publish/`: th
 - There is still no way to clear an opened (file-backed) capture other than `close_capture`, which
   is almost certainly the right trade — but the `clear_*` tools do accept a `capture` argument, so
   the asymmetry is now visible where it was not before.
+
+## Hardening pass (2026-08-24)
+
+The follow-up review fixed several concurrency and failure-path defects: proxy takeover now fails
+closed when the original settings cannot be read; response and timed-script capture use isolated
+snapshots; timed runners and install probes are bounded and no longer use the shared thread pool;
+saves use unique temporary files; opened capture names cannot silently replace one another; and
+lifecycle state reads are synchronized with start and stop.
+
+## Internal module boundaries (2026-08-24)
+
+`CaptureProxy` is now the stable façade for MCP tools rather than the owner of every moving part.
+`CapturePipeline` owns Titanium's paired request/response hooks, capture windows, and body policy;
+`ScriptRuntime` owns both bounded probe and runtime execution; `CaptureCatalog` owns live/opened
+capture naming and resolution; and `SystemProxyLease` owns the registry snapshot, marker, and named
+semaphore that protect Windows proxy settings. All four are concrete internal classes: no adapter
+interfaces or public API were added.
+
+The extraction also made the local-answer path explicit: because Titanium never raises a response
+hook for an answer supplied during `before_request`, the pipeline now updates the held exchange once
+that response is complete. It therefore records the local status, body, size, and completion time
+instead of leaving a response-looking exchange marked unfinished.

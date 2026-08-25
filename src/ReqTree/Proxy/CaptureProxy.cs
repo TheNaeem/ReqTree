@@ -1,23 +1,19 @@
-using System.ComponentModel;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ReqTree.App;
 using ReqTree.Proxy.Objects;
-using ReqTree.WinApi;
 using Serilog;
 using Serilog.Extensions.Logging;
 using Titanium.Web.Proxy;
-using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Logging;
 using Titanium.Web.Proxy.Models;
 
 namespace ReqTree.Proxy;
 
 /// <summary>
-/// Owns the Titanium.Web.Proxy instance: root certificate, listening endpoint, system proxy
-/// registration, and the two hooks that will turn live traffic into captured exchanges.
+/// Owns the Titanium.Web.Proxy lifecycle: root certificate, listening endpoint, and system proxy
+/// registration.
 /// </summary>
 /// <remarks>
 /// The Titanium server is built fresh in <see cref="TryStart"/> and disposed in <see cref="Stop"/>
@@ -26,65 +22,27 @@ namespace ReqTree.Proxy;
 /// has. Callers never see the swap, because the port and the state live on this class, not on the
 /// server underneath.
 ///
-/// Tracking whether we own the machine's proxy settings lives here too, as ordinary members. It is
-/// this object's business — nothing else in the program can know it — and a separate holder for
-/// four short methods would only put a class boundary between the flag and the file recording it.
+/// Capture transport, file-capture names, script runners, and Windows proxy ownership each keep
+/// their own coupled state behind an internal module. This class remains the stable façade the MCP
+/// layer uses to start, stop, and configure all of them.
 /// </remarks>
 public sealed class CaptureProxy : IAsyncDisposable
 {
-    /// <summary>
-    /// What gets written to disk when we take over the machine's proxy settings, so a run that
-    /// dies without cleaning up can be undone by the next one.
-    /// </summary>
-    /// <remarks>
-    /// It carries the settings that were in place before we touched them, because that is the one
-    /// thing a later process cannot work out for itself. Titanium's own
-    /// RestoreOriginalProxySettings only knows what *its* instance replaced, so a fresh server in a
-    /// new process restores nothing at all — and does it without complaining.
-    /// </remarks>
-    private sealed record ProxyStateMarker(
-        int ProcessId,
-        DateTimeOffset StartedAt,
-        int Port,
-        int? OriginalProxyEnable,
-        string? OriginalProxyServer);
-
-    /// <summary>Where Windows keeps the per-user proxy settings Titanium writes.</summary>
-    private const string InternetSettingsKey =
-        @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-
     private readonly bool _registerAsSystemProxy;
     private readonly bool _installCertificateTrust;
+    private readonly SystemProxyLease _systemProxy = new();
 
     /// <summary>Serialises start and stop, which can arrive concurrently once tools can call them.</summary>
     private readonly Lock _lifecycleLock = new();
 
     /// <summary>Null whenever the proxy is stopped.</summary>
     private ProxyServer? _proxyServer;
-    private bool _systemProxyWasSet;
-
-    /// <summary>
-    /// What the machine's proxy settings were before we took them over. Held so <see cref="Stop"/>
-    /// can put them back through the same code the crash-recovery path uses, rather than trusting
-    /// Titanium to remember.
-    /// </summary>
-    private (int? Enable, string? Server) _originalSystemProxy;
-
+    private readonly CapturePipeline _pipeline;
     /// <summary>
     /// Everything this proxy has captured. The same shape a capture loaded from a file has, which
     /// is what the read side gets handed instead when there is no proxy running at all.
     /// </summary>
     public ExchangeStore Capture { get; }
-
-    /// <summary>
-    /// Numbers every exchange the proxy sees, recorded or not.
-    /// </summary>
-    /// <remarks>
-    /// The proxy assigns ids rather than leaving it to the store, because rules and scripts run
-    /// whether or not recording is on — and an unrecorded exchange with no id makes every line it
-    /// logs say "exchange 0", which is exactly when you most need to tell them apart.
-    /// </remarks>
-    private long _nextExchangeId;
 
     /// <summary>
     /// Whether exchanges are being recorded. Turning it off leaves traffic flowing normally but
@@ -98,11 +56,9 @@ public sealed class CaptureProxy : IAsyncDisposable
     /// </remarks>
     public bool CaptureEnabled
     {
-        get => _captureEnabled;
-        set => _captureEnabled = value;
+        get => _pipeline.CaptureEnabled;
+        set => _pipeline.CaptureEnabled = value;
     }
-
-    private volatile bool _captureEnabled = true;
 
     // Ordered rather than hashed, because the order they run in is part of what a rule or script
     // means. See BehaviourList for why that rules out a HashSet.
@@ -132,43 +88,26 @@ public sealed class CaptureProxy : IAsyncDisposable
         .. _scripts.Items.Select(s => (s, (string?)null)),
     ];
 
-    /// <summary>
-    /// Captures opened from a file, by the name they were opened under. Held alongside the live
-    /// one rather than replacing it, so opening yesterday's capture to compare against does not
-    /// throw away what is being recorded now. Read tools name which one they mean.
-    /// </summary>
-    private readonly Dictionary<string, ExchangeStore> _opened = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Lock _openedLock = new();
+    private readonly CaptureCatalog _captures;
 
     /// <summary>Names of the captures opened from files.</summary>
     public IReadOnlyList<string> OpenedCaptures
-    {
-        get { lock (_openedLock) return [.. _opened.Keys]; }
-    }
+        => _captures.OpenedNames;
 
-    /// <summary>Adds an opened capture under a name, replacing any already held under it.</summary>
-    public void AddOpenedCapture(string name, ExchangeStore store)
-    {
-        lock (_openedLock) _opened[name] = store;
-    }
+    /// <summary>Adds an opened capture under a name, if that name is not already in use.</summary>
+    public bool AddOpenedCapture(string name, ExchangeStore store) => _captures.AddOpened(name, store);
 
     /// <summary>Forgets an opened capture. The live one cannot be closed.</summary>
-    public bool CloseCapture(string name)
-    {
-        lock (_openedLock) return _opened.Remove(name);
-    }
+    public bool CloseCapture(string name) => _captures.Close(name);
 
     /// <summary>
     /// The capture a read tool means. Null or "live" is the one being recorded; anything else is
     /// a file opened under that name.
     /// </summary>
-    public ExchangeStore? ResolveCapture(string? name)
-    {
-        if (string.IsNullOrWhiteSpace(name) || name.Equals("live", StringComparison.OrdinalIgnoreCase))
-            return Capture;
+    public ExchangeStore? ResolveCapture(string? name) => _captures.Resolve(name);
 
-        lock (_openedLock) return _opened.GetValueOrDefault(name);
-    }
+    internal CaptureName ResolveOpenedCaptureName(string fullPath, string? requestedName) =>
+        _captures.ResolveOpenedName(fullPath, requestedName);
 
     /// <summary>
     /// Raised once an exchange is finished, whether answered upstream or by a rule. The console
@@ -176,53 +115,36 @@ public sealed class CaptureProxy : IAsyncDisposable
     /// </summary>
     public event Action<Exchange>? ExchangeCompleted;
 
-    /// <summary>
-    /// Stops recording the first time an exchange matches. Null when no window is armed.
-    /// </summary>
-    /// <remarks>
-    /// A capture window exists so a session can say "record until the sign-in POST happens" and
-    /// then walk away, instead of watching for the moment to call stop_capture and catching an
-    /// extra minute of background noise either side of it.
-    ///
-    /// Not volatile, deliberately: it is claimed with <see cref="Interlocked.CompareExchange{T}"/>,
-    /// and a volatile field cannot be passed by reference. Reads go through
-    /// <see cref="Volatile.Read{T}"/> instead.
-    /// </remarks>
-    private CaptureWindow? _captureWindow;
-
-    /// <summary>
-    /// Id of the exchange that closed the last capture window, or zero. Recording stops the moment a
-    /// window closes, but that one exchange still gets its response half recorded — otherwise a
-    /// window armed on "the sign-in POST" captures the request and misses the token in the reply,
-    /// which is the very thing it was armed for.
-    /// </summary>
-    private long _windowClosingExchangeId;
-
     /// <summary>An armed stop condition, and what it was described as.</summary>
     public sealed record CaptureWindow(Func<Exchange, bool> StopWhen, string Description, string? ArmedBy);
 
     /// <summary>What is armed right now, or null.</summary>
-    public CaptureWindow? ArmedWindow => Volatile.Read(ref _captureWindow);
+    public CaptureWindow? ArmedWindow => _pipeline.ArmedWindow is { } window
+        ? new CaptureWindow(window.StopWhen, window.Description, window.ArmedBy)
+        : null;
 
     /// <summary>Arms a stop condition, replacing any already armed.</summary>
     public void ArmCaptureWindow(CaptureWindow window)
     {
-        Volatile.Write(ref _captureWindow, window);
-        Log.Information("Capture window armed by {Actor}: recording stops when {Description}.",
-            window.ArmedBy ?? "unidentified", window.Description);
+        _pipeline.Arm(new CaptureWindowState(window.StopWhen, window.Description, window.ArmedBy));
     }
 
     /// <summary>Disarms the window. Returns what was armed, or null if nothing was.</summary>
-    public CaptureWindow? DisarmCaptureWindow() => Interlocked.Exchange(ref _captureWindow, null);
+    public CaptureWindow? DisarmCaptureWindow() => _pipeline.Disarm() is { } window
+        ? new CaptureWindow(window.StopWhen, window.Description, window.ArmedBy)
+        : null;
 
     /// <summary>Port this proxy listens on.</summary>
     public int Port { get; }
 
     /// <summary>True while the proxy is listening.</summary>
-    public bool IsRunning => _proxyServer?.ProxyRunning ?? false;
+    public bool IsRunning
+    {
+        get { lock (_lifecycleLock) return _proxyServer?.ProxyRunning ?? false; }
+    }
 
     /// <summary>True when we have pointed the machine's proxy settings at ourselves.</summary>
-    public bool IsSystemProxy => _systemProxyWasSet;
+    public bool IsSystemProxy => _systemProxy.IsTaken;
 
     /// <param name="port">TCP port to listen on.</param>
     /// <param name="registerAsSystemProxy">
@@ -247,12 +169,17 @@ public sealed class CaptureProxy : IAsyncDisposable
         _registerAsSystemProxy = registerAsSystemProxy;
         _installCertificateTrust = installCertificateTrust;
         Capture = capture ?? new ExchangeStore();
+        _captures = new CaptureCatalog(Capture);
+        _pipeline = new CapturePipeline(
+            Capture,
+            ApplyBehaviour,
+            exchange => ExchangeCompleted?.Invoke(exchange));
 
         // A cap that stops recording has to turn capture off as well, or the hooks carry on
         // building exchanges the store then refuses one at a time.
         Capture.LimitReached += reason =>
         {
-            _captureEnabled = false;
+            _pipeline.CaptureEnabled = false;
             Log.Warning("{Reason}", reason);
         };
     }
@@ -303,20 +230,8 @@ public sealed class CaptureProxy : IAsyncDisposable
                 // user points their client at us manually; capture works identically either way.
                 if (_registerAsSystemProxy && OperatingSystem.IsWindows())
                 {
-                    if (TryClaimSystemProxyOwnership())
-                    {
-                        // Read before the takeover, or what we record is our own settings and the
-                        // recovery path faithfully restores the broken state.
-                        _originalSystemProxy = ReadSystemProxySettings();
-
-                        server.SetAsSystemProxy(endPoint, ProxyProtocolType.AllHttp);
-                        _systemProxyWasSet = true;
-
-                        // Written immediately after taking over, so a crash between here and
-                        // shutdown still leaves enough behind for the next run to undo it.
-                        RecordProxyState(_originalSystemProxy);
-                    }
-                    else
+                    if (_systemProxy.TakeOver(server, endPoint, Port)
+                        is SystemProxyTakeover.OwnedByAnotherReqTree)
                     {
                         Log.Warning(
                             "Another ReqTree already owns this machine's proxy settings, so this one "
@@ -330,7 +245,7 @@ public sealed class CaptureProxy : IAsyncDisposable
                 _proxyServer = server;
 
                 Log.Information("Proxy listening on port {Port}. System proxy {SystemProxy}.",
-                    Port, _systemProxyWasSet ? "points at ReqTree" : "was not changed");
+                    Port, _systemProxy.IsTaken ? "points at ReqTree" : "was not changed");
 
                 return true;
             }
@@ -340,13 +255,11 @@ public sealed class CaptureProxy : IAsyncDisposable
                 // the teardown below it — leaving a half-started proxy still holding its listener
                 // and never disposed, on top of the settings being wrong. Each has to be able to
                 // fail without taking the other with it.
-                if (_systemProxyWasSet)
+                if (_systemProxy.IsTaken)
                 {
                     try
                     {
-                        RestoreSystemProxySettings(_originalSystemProxy);
-                        _systemProxyWasSet = false;
-                        ClearProxyState();
+                        _systemProxy.RestoreAfterFailedStart();
                     }
                     catch (Exception restoreFailure)
                     {
@@ -359,9 +272,9 @@ public sealed class CaptureProxy : IAsyncDisposable
                 }
 
                 // Unconditional: the claim may have been taken and the takeover then failed before
-                // _systemProxyWasSet was ever set, and holding it after a failed start would lock
+                // the lease recorded its takeover, and holding it after a failed start would lock
                 // every later run of this process out of the settings it never touched.
-                ReleaseSystemProxyOwnership();
+                _systemProxy.ReleaseOwnership();
 
                 // Whatever was half-built has to go, or the next attempt inherits a server that
                 // already holds the endpoint and fails for a second, more confusing reason.
@@ -399,9 +312,9 @@ public sealed class CaptureProxy : IAsyncDisposable
 
             // Captured before the restore clears it, so the message below can say what actually
             // happened rather than claiming a restore that never took place.
-            var hadSystemProxy = _systemProxyWasSet;
+            var hadSystemProxy = _systemProxy.IsTaken;
 
-            if (_systemProxyWasSet)
+            if (_systemProxy.IsTaken)
             {
                 try
                 {
@@ -415,15 +328,7 @@ public sealed class CaptureProxy : IAsyncDisposable
                     // for writing. That has to be treated exactly like a thrown failure: the
                     // settings are still ours, the marker must survive for the next run, and the
                     // message below must not claim a restore that did not happen.
-                    if (RestoreSystemProxySettings(_originalSystemProxy))
-                    {
-                        _systemProxyWasSet = false;
-
-                        // Cleared only after the restore succeeded, so the marker outliving us always
-                        // means the settings really are still ours.
-                        ClearProxyState();
-                    }
-                    else
+                    if (!_systemProxy.TryRestore())
                     {
                         Log.Error(
                             "Could not restore the machine's proxy settings. They still point at "
@@ -451,7 +356,7 @@ public sealed class CaptureProxy : IAsyncDisposable
 
             // Given up whether or not the restore worked. If it failed the marker is still there and
             // the next run repairs it, and that run needs to be able to claim ownership to do so.
-            ReleaseSystemProxyOwnership();
+            _systemProxy.ReleaseOwnership();
 
             var wasRunning = server.ProxyRunning;
             if (wasRunning) server.Stop();
@@ -461,13 +366,12 @@ public sealed class CaptureProxy : IAsyncDisposable
             server.Dispose();
             _proxyServer = null;
 
-            // Reported from what actually happened, not from what was attempted. _systemProxyWasSet
-            // is cleared only by a restore that succeeded, so it still being set here means the
-            // catch above ran — and saying "restored" then would be the same false-success claim
-            // that made the original Titanium restore so dangerous.
+            // Reported from what actually happened, not from what was attempted. The lease clears
+            // its taken state only after a successful restore, so saying "restored" after a failure
+            // would repeat the false-success claim that made Titanium's own method dangerous.
             if (!hadSystemProxy)
                 Log.Information("Proxy stopped. System proxy settings were never changed.");
-            else if (!_systemProxyWasSet)
+            else if (!_systemProxy.IsTaken)
                 Log.Information("Proxy stopped and system proxy settings restored.");
             else
                 Log.Error("Proxy stopped, but the machine's proxy settings could NOT be restored "
@@ -499,37 +403,7 @@ public sealed class CaptureProxy : IAsyncDisposable
     /// </remarks>
     /// <returns>A description of what was cleaned up, or null when there was nothing stale.</returns>
     public string? CleanStaleState()
-    {
-        var stale = FindStaleProxyState();
-        if (stale is null) return null;
-
-        // A marker with nothing recorded in it cannot be acted on: we would be guessing at settings
-        // the user may have chosen deliberately. Say so plainly and leave it alone.
-        if (stale.OriginalProxyEnable is null && stale.OriginalProxyServer is null)
-            return $"ReqTree process {stale.ProcessId} took port {stale.Port} at {stale.StartedAt:u} "
-                 + "and exited without cleaning up, but recorded no previous settings to restore. "
-                 + "Check your proxy settings by hand.";
-
-        try
-        {
-            if (!RestoreSystemProxySettings((stale.OriginalProxyEnable, stale.OriginalProxyServer)))
-                return $"Found stale proxy state from process {stale.ProcessId}, but this platform "
-                     + "has no system proxy setting to restore.";
-
-            ClearProxyState();
-
-            return $"Restored system proxy settings left behind by ReqTree process "
-                 + $"{stale.ProcessId}, which had taken port {stale.Port} at {stale.StartedAt:u} "
-                 + "and exited without cleaning up.";
-        }
-        catch (Exception ex)
-        {
-            // Reported rather than thrown: the caller is usually startup, and failing to heal is
-            // not a reason to refuse to run. The marker stays, so the next run tries again.
-            return $"Found stale proxy state from process {stale.ProcessId} but could not restore "
-                 + $"it: {ex.Message}. The system proxy may still point at port {stale.Port}.";
-        }
-    }
+        => _systemProxy.CleanStaleState();
 
     public ValueTask DisposeAsync()
     {
@@ -537,7 +411,7 @@ public sealed class CaptureProxy : IAsyncDisposable
 
         // Stop releases it on the path where a proxy was running. This catches the other one: a
         // process that claimed ownership, failed somewhere odd, and is now going away holding it.
-        ReleaseSystemProxyOwnership();
+        _systemProxy.Dispose();
 
         return ValueTask.CompletedTask;
     }
@@ -841,24 +715,31 @@ public sealed class CaptureProxy : IAsyncDisposable
 
             try
             {
-                if (!RunWithinTimeout(script, exchange))
+                var scriptResult = ScriptRuntime.Run(script, exchange);
+                if (scriptResult is not ScriptRunResult.Completed)
                 {
-                    // Disabled, not merely skipped. The thread running it cannot be stopped — .NET
-                    // has no way to interrupt code that will not yield — so the only thing that can
-                    // be prevented is the next request starting another one. One leaked thread is
-                    // survivable; one per request is not.
+                    // Disabled, not merely skipped. A non-cooperative runner cannot be stopped, so
+                    // a finite runner cap prevents abandoned threads growing without bound.
                     script.Enabled = false;
                     script.RecordTimeout();
 
-                    Log.Error(
-                        "Script {Script} (added by {Actor}) did not finish within {Timeout} on "
-                        + "{Hook} for {Method} {Url} (exchange {Id}), so it has been DISABLED and "
-                        + "the request carried on without it. The thread it left behind cannot be "
-                        + "stopped and will use CPU until it returns on its own — if it never does, "
-                        + "restart ReqTree. Check the script for a loop that cannot exit; fix it and "
-                        + "add it again, or pass a longer timeout_ms if it genuinely needs one.",
-                        script.Name, script.AddedBy ?? "unidentified", script.Timeout,
-                        hook, exchange.Method, exchange.Url, exchange.Id);
+                    if (scriptResult is ScriptRunResult.RunnerLimitReached)
+                        Log.Error(
+                            "Script {Script} (added by {Actor}) could not get one of the {Limit} "
+                            + "bounded timed-script runners on {Hook} for {Method} (exchange {Id}), "
+                            + "so it has been DISABLED and the request carried on without it.",
+                            script.Name, script.AddedBy ?? "unidentified", ScriptRuntime.MaxTimedRunners,
+                            hook, exchange.Method, exchange.Id);
+                    else
+                        Log.Error(
+                            "Script {Script} (added by {Actor}) did not finish within {Timeout} on "
+                            + "{Hook} for {Method} {Url} (exchange {Id}), so it has been DISABLED and "
+                            + "the request carried on without it. The abandoned runner cannot be "
+                            + "stopped and will use CPU until it returns on its own. Inspect the "
+                            + "script for an infinite loop, blocking wait, or async operation that "
+                            + "never completes; list_scripts shows the source.",
+                            script.Name, script.AddedBy ?? "unidentified", script.Timeout,
+                            hook, exchange.Method, exchange.Url, exchange.Id);
 
                     continue;
                 }
@@ -889,55 +770,6 @@ public sealed class CaptureProxy : IAsyncDisposable
                     exchange.Method, exchange.Url, script.ErrorCount);
             }
         }
-    }
-
-    /// <summary>
-    /// Runs a script, giving up on it if it takes longer than its timeout.
-    /// </summary>
-    /// <remarks>
-    /// A timeout cannot cancel the script — nothing in .NET can interrupt arbitrary code that does
-    /// not cooperate, and the APIs that once claimed to (Thread.Abort) are gone for good reasons. So
-    /// what this buys is narrower than it looks, and worth being exact about: the *request* stops
-    /// waiting. Traffic keeps flowing, the exchange is recorded, and the caller is not left hanging
-    /// on a loop that will never end.
-    ///
-    /// Anything the script throws is re-thrown on this thread so the existing handler reports it
-    /// with the script's name, exactly as it did when scripts ran inline.
-    ///
-    /// A zero timeout runs inline instead. That is not just an escape hatch for someone who trusts
-    /// their own code — it also skips the thread-pool hop, which is real cost on a path that runs
-    /// for every request.
-    /// </remarks>
-    /// <returns>False when it ran out of time.</returns>
-    private static bool RunWithinTimeout(Script script, Exchange exchange)
-    {
-        if (script.Timeout <= TimeSpan.Zero)
-        {
-            script.Run(exchange);
-            return true;
-        }
-
-        Exception? thrown = null;
-
-        var work = Task.Run(() =>
-        {
-            try
-            {
-                script.Run(exchange);
-            }
-            catch (Exception ex)
-            {
-                // Captured rather than left to fault the task: an unobserved faulted task is a
-                // finalizer-thread crash waiting to happen, and the timeout path never awaits it.
-                thrown = ex;
-            }
-        });
-
-        if (!work.Wait(script.Timeout)) return false;
-
-        if (thrown is not null) throw thrown;
-
-        return true;
     }
 
     /// <summary>
@@ -1052,8 +884,7 @@ public sealed class CaptureProxy : IAsyncDisposable
         // the server on the logger it built at construction.
         server.ApplyLoggingConfiguration();
 
-        server.BeforeRequest += OnBeforeRequestAsync;
-        server.BeforeResponse += OnBeforeResponseAsync;
+        _pipeline.Attach(server);
     }
 
     /// <summary>
@@ -1086,631 +917,4 @@ public sealed class CaptureProxy : IAsyncDisposable
         }
     }
 
-    /// <summary>Sees every request before it goes upstream.</summary>
-    private async Task OnBeforeRequestAsync(object sender, SessionEventArgs e)
-    {
-        var request = e.HttpClient.Request;
-        var uri = request.RequestUri;
-
-        var exchange = new Exchange
-        {
-            // Numbered here rather than by the store, so it has an id even when recording is off
-            // and every line a rule or script logs about it can name it.
-            Id = Interlocked.Increment(ref _nextExchangeId),
-            StartedAt = DateTimeOffset.Now,
-            Method = request.Method,
-            Url = request.Url,
-            Host = uri.Host,
-            Path = uri.AbsolutePath,
-            QueryString = uri.Query,
-            HttpVersion = request.HttpVersion.ToString(),
-            RequestHeaders = ReadHeaders(request.Headers),
-            RequestContentType = request.ContentType,
-        };
-
-        // Titanium hands us the same SessionEventArgs object again when the response arrives, so
-        // parking the exchange here is how the two halves find each other.
-        e.UserData = exchange;
-
-        if (request.HasBody && ShouldCaptureExchange(request.ContentType, request.ContentLength))
-        {
-            try
-            {
-                // KeepBody has to be set before the body is read, otherwise Titanium streams it
-                // upstream and discards it, and GetRequestBody comes back empty.
-                request.KeepBody = true;
-                (exchange.RequestBody, exchange.RequestBodyTruncated) = Truncate(await e.GetRequestBody());
-            }
-            catch (Exception ex)
-            {
-                // A body we cannot read is not a reason to drop the request from the capture.
-                Log.Debug("Could not read the request body for {Url}: {Reason}", request.Url, ex.Message);
-            }
-        }
-
-        // Recorded before behaviour runs, so a request a rule blocks is still captured — being
-        // able to see what you blocked is the whole point of blocking it here rather than at a
-        // firewall. Recording being off does not stop rules and scripts below: capture is about
-        // what is kept, not about what ReqTree does to traffic.
-        if (_captureEnabled)
-        {
-            Capture.AddExchange(exchange);
-
-            // Checked after the exchange is stored, so the request that closes a window is itself
-            // captured. Stopping on "the sign-in POST" and then not having it would be useless.
-            CheckCaptureWindow(exchange);
-        }
-
-        // Behaviour runs after the body is read, so a condition can match on body content.
-        var originalUrl = exchange.Url;
-        var originalHeaders = exchange.RequestHeaders;
-        var originalBody = exchange.RequestBody;
-
-        ApplyBehaviour(exchange, ProxyHook.BeforeRequest);
-
-        // Again, so the record shows what ReqTree actually did rather than what the client sent.
-        // AddExchange recognises the id from the first call and updates in place. The closing
-        // exchange of a capture window is recorded here too, even though recording has just been
-        // switched off — a window armed on a request that is then answered locally has its mock
-        // response only at this point.
-        if (_captureEnabled || Interlocked.Read(ref _windowClosingExchangeId) == exchange.Id)
-            Capture.AddExchange(exchange);
-
-        // A response set during the request hook means "answer this yourself" - the request never
-        // goes upstream. That is how block and mock work without a separate concept for either.
-        if (exchange.StatusCode is not null)
-        {
-            exchange.CompletedAt ??= DateTimeOffset.Now;
-
-            // There is no server to report a size here, so the mock's own body length is the honest
-            // one. Left unset it stays zero, which reads as "empty response" next to a real body.
-            exchange.ResponseSizeBytes = exchange.ResponseBody?.Length ?? 0;
-
-            var headers = new List<HttpHeader>
-            {
-                new("Content-Type", exchange.ResponseContentType ?? "application/json"),
-            };
-
-            if (exchange.ResponseHeaders is { } extra)
-                foreach (var (name, value) in extra)
-                    if (!name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
-                        headers.Add(new HttpHeader(name, value));
-
-            e.GenericResponse(
-                exchange.ResponseBody ?? [],
-                (HttpStatusCode)exchange.StatusCode.Value,
-                headers,
-                closeServerConnection: true);
-
-            // Cleared so the response hook knows there is nothing left to complete: this exchange
-            // was answered here and never had a real response to wait for.
-            e.UserData = null;
-
-            Log.Information(
-                "Answered {Method} {Url} locally with {Status} ({Bytes} byte body); it was not "
-                + "sent upstream. Exchange {Id}.",
-                exchange.Method, exchange.Url, exchange.StatusCode,
-                exchange.ResponseBody?.Length ?? 0, exchange.Id);
-
-            // Raised here too: from the outside this exchange is finished, and a console view that
-            // showed only the ones that went upstream would silently omit everything a rule blocked.
-            ExchangeCompleted?.Invoke(exchange);
-            return;
-        }
-
-        WriteRequestChangesBack(exchange, e, originalUrl, originalHeaders, originalBody);
-    }
-
-    /// <summary>
-    /// Pushes anything a rule or script changed on the exchange onto the request about to go out.
-    /// </summary>
-    /// <remarks>
-    /// Compared against what arrived rather than applied unconditionally, so an untouched request
-    /// is passed through byte for byte and only deliberate edits reach the wire.
-    /// </remarks>
-    private static void WriteRequestChangesBack(
-        Exchange exchange,
-        SessionEventArgs e,
-        string originalUrl,
-        IReadOnlyList<(string Name, string Value)> originalHeaders,
-        byte[]? originalBody)
-    {
-        var request = e.HttpClient.Request;
-
-        if (!string.Equals(exchange.Url, originalUrl, StringComparison.Ordinal))
-        {
-            request.Url = exchange.Url;
-
-            // The Host header still names the original server, which most servers reject as a
-            // mismatched virtual host. Replacing it is what makes a redirect actually work; there
-            // is no set-or-add on this collection, so remove then add.
-            if (Uri.TryCreate(exchange.Url, UriKind.Absolute, out var target))
-            {
-                request.Headers.RemoveHeader("Host");
-                request.Headers.AddHeader("Host", target.Authority);
-            }
-
-            Log.Information("Request {Id} redirected from {From} to {To}.",
-                exchange.Id, originalUrl, exchange.Url);
-        }
-
-        if (!ReferenceEquals(exchange.RequestHeaders, originalHeaders))
-        {
-            foreach (var (name, _) in originalHeaders)
-                request.Headers.RemoveHeader(name);
-
-            foreach (var (name, value) in exchange.RequestHeaders)
-            {
-                request.Headers.RemoveHeader(name);
-                request.Headers.AddHeader(name, value);
-            }
-
-            Log.Information("Request {Id} headers rewritten: {Before} became {After} header(s).",
-                exchange.Id, originalHeaders.Count, exchange.RequestHeaders.Count);
-        }
-
-        if (!ReferenceEquals(exchange.RequestBody, originalBody))
-        {
-            // Goes through Titanium rather than touching the bytes directly, because this is what
-            // rewrites Content-Length to match.
-            e.SetRequestBody(exchange.RequestBody ?? []);
-
-            Log.Information("Request {Id} body rewritten: {Before} bytes became {After} bytes.",
-                exchange.Id, originalBody?.Length ?? 0, exchange.RequestBody?.Length ?? 0);
-        }
-    }
-
-    /// <summary>Sees every response before it reaches the client.</summary>
-    private async Task OnBeforeResponseAsync(object sender, SessionEventArgs e)
-    {
-        // Missing UserData means we never saw the request half — a response the proxy synthesised
-        // itself, say — so there is nothing to complete.
-        if (e.UserData is not Exchange exchange)
-            return;
-
-        var response = e.HttpClient.Response;
-
-        exchange.CompletedAt = DateTimeOffset.Now;
-        exchange.StatusCode = response.StatusCode;
-        exchange.ResponseHeaders = ReadHeaders(response.Headers);
-        exchange.ResponseContentType = response.ContentType;
-        exchange.ResponseSizeBytes = response.ContentLength > 0 ? response.ContentLength : 0;
-
-        if (response.HasBody && ShouldCaptureExchange(response.ContentType, response.ContentLength))
-        {
-            try
-            {
-                response.KeepBody = true;
-
-                // Titanium hands back the decoded body, so gzip and brotli responses arrive
-                // readable rather than as a wall of binary.
-                var body = await e.GetResponseBody();
-                (exchange.ResponseBody, exchange.ResponseBodyTruncated) = Truncate(body);
-
-                // A chunked response has no Content-Length, so what was actually read is the only
-                // honest size to report.
-                if (exchange.ResponseSizeBytes == 0)
-                    exchange.ResponseSizeBytes = body.Length;
-            }
-            catch (Exception ex)
-            {
-                Log.Debug("Could not read the response body for {Url}: {Reason}", exchange.Url, ex.Message);
-            }
-        }
-
-        var originalStatus = exchange.StatusCode;
-        var originalHeaders = exchange.ResponseHeaders;
-        var originalBody = exchange.ResponseBody;
-
-        // Scripts see the response after it is captured, so one rewriting a body cannot change
-        // what was recorded - the capture stays a record of what the server actually sent.
-        ApplyBehaviour(exchange, ProxyHook.BeforeResponse);
-
-        // The same exchange, now with its response half. AddExchange recognises it by the id it was
-        // given on the way in and updates rather than filing the request a second time. It refuses
-        // if the request half was dropped to stay within the caps, which is correct — half an
-        // exchange, with a response and no request, is worse than none. The exchange that closed a
-        // capture window is recorded here even though recording is now off, so its response is kept.
-        if (_captureEnabled || Interlocked.Read(ref _windowClosingExchangeId) == exchange.Id)
-        {
-            Capture.AddExchange(exchange);
-            Interlocked.Exchange(ref _windowClosingExchangeId, 0);
-        }
-
-        if (exchange.StatusCode != originalStatus && exchange.StatusCode is { } status)
-        {
-            response.StatusCode = status;
-            Log.Information("Response {Id} status rewritten from {From} to {To}.",
-                exchange.Id, originalStatus, status);
-        }
-
-        if (!ReferenceEquals(exchange.ResponseHeaders, originalHeaders)
-            && exchange.ResponseHeaders is { } headers)
-        {
-            // Everything that was there is removed first, exactly as the request path does. Adding
-            // only what is in the new list would mean a script could add or change a response
-            // header but never remove one — and it would look like it had.
-            if (originalHeaders is not null)
-                foreach (var (name, _) in originalHeaders)
-                    response.Headers.RemoveHeader(name);
-
-            foreach (var (name, value) in headers)
-            {
-                response.Headers.RemoveHeader(name);
-                response.Headers.AddHeader(name, value);
-            }
-
-            Log.Information("Response {Id} headers rewritten: {Before} became {After} header(s).",
-                exchange.Id, originalHeaders?.Count ?? 0, headers.Count);
-        }
-
-        if (!ReferenceEquals(exchange.ResponseBody, originalBody))
-        {
-            e.SetResponseBody(exchange.ResponseBody ?? []);
-
-            Log.Information("Response {Id} body rewritten: {Before} bytes became {After} bytes.",
-                exchange.Id, originalBody?.Length ?? 0, exchange.ResponseBody?.Length ?? 0);
-        }
-
-        ExchangeCompleted?.Invoke(exchange);
-    }
-
-    /// <summary>Stops recording when an armed window's condition matches.</summary>
-    private void CheckCaptureWindow(Exchange exchange)
-    {
-        if (Volatile.Read(ref _captureWindow) is not { } window) return;
-
-        bool closes;
-
-        try
-        {
-            closes = window.StopWhen(exchange);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "The armed capture window threw while testing {Method} {Url}. "
-                + "Recording continues.", exchange.Method, exchange.Url);
-            return;
-        }
-
-        if (!closes) return;
-
-        // Claimed atomically. Requests arrive on many threads at once, so two of them can match the
-        // same window simultaneously; without this both would stop recording and both would log it,
-        // and the count each reported would be wrong. Only the thread that swaps the window out
-        // carries on.
-        if (Interlocked.CompareExchange(ref _captureWindow, null, window) != window) return;
-
-        _captureEnabled = false;
-        Interlocked.Exchange(ref _windowClosingExchangeId, exchange.Id);
-
-        Log.Information(
-            "Capture window armed by {Actor} closed on {Method} {Url} (exchange {Id}): "
-            + "{Description}. Recording is now off with {Count} exchange(s) held.",
-            window.ArmedBy ?? "unidentified", exchange.Method, exchange.Url, exchange.Id,
-            window.Description, Capture.Count);
-    }
-
-    /// <summary>Copies Titanium's header collection into our own plain list.</summary>
-    private static List<(string Name, string Value)> ReadHeaders(IEnumerable<HttpHeader> headers)
-    {
-        var result = new List<(string Name, string Value)>();
-        foreach (var header in headers)
-            result.Add((header.Name, header.Value));
-        return result;
-    }
-
-    /// <summary>
-    /// Bodies past this are stored cut down to it, with the truncated flag set. A megabyte
-    /// comfortably holds any API payload a person actually reads.
-    /// </summary>
-    private const int MaxBodyBytes = 1024 * 1024;
-
-    /// <summary>Content types whose bodies are worth keeping, matched as a prefix.</summary>
-    private static readonly string[] CapturedContentTypes =
-    [
-        "text/",
-        "application/json",
-        "application/ld+json",
-        "application/problem+json",
-        "application/xml",
-        "application/xhtml+xml",
-        "application/javascript",
-        "application/x-javascript",
-        "application/x-www-form-urlencoded",
-        "application/graphql",
-        "application/csp-report",
-        "multipart/form-data",
-    ];
-
-    /// <summary>
-    /// True when a body with this content type and declared length is worth storing.
-    /// </summary>
-    /// <remarks>
-    /// Reading a body means buffering it in memory and, for a streaming response, waiting for an
-    /// end that may never arrive. So this leans toward the things someone reverse-engineers an API
-    /// with — JSON, forms, text — and skips bulk media that would cost memory without ever being
-    /// read.
-    /// </remarks>
-    /// <param name="contentType">Raw Content-Type header value, or null when absent.</param>
-    /// <param name="contentLength">Declared length, or -1 when the body is chunked.</param>
-    private static bool ShouldCaptureExchange(string? contentType, long contentLength)
-    {
-        // Server-sent events never end on their own. Reading one would hang the exchange.
-        if (contentType is not null
-            && contentType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // A body with no content type is usually small and hand-rolled, which makes it exactly the
-        // kind of thing someone is trying to understand. Keep it.
-        if (string.IsNullOrWhiteSpace(contentType))
-            return contentLength is > 0 and <= MaxBodyBytes;
-
-        var bareType = contentType.Split(';')[0].Trim();
-
-        if (!CapturedContentTypes.Any(
-                candidate => bareType.StartsWith(candidate, StringComparison.OrdinalIgnoreCase)))
-            return false;
-
-        // A chunked body of an interesting type is worth reading even though its size is not known
-        // up front — that is how most JSON APIs stream their responses.
-        return contentLength <= MaxBodyBytes;
-    }
-
-    /// <summary>Cuts a body down to the cap. Returns the bytes to store and whether they were cut.</summary>
-    private static (byte[] Body, bool WasTruncated) Truncate(byte[] body) =>
-        body.Length <= MaxBodyBytes ? (body, false) : (body[..MaxBodyBytes], true);
-
-    // ---------------------------------------------------------------------------------
-    // The marker file recording that we own the machine's proxy settings
-    // ---------------------------------------------------------------------------------
-
-    /// <summary>
-    /// Reads the machine's current proxy settings, so we can put them back later. Nulls mean the
-    /// value was not set, which is itself worth recording: restoring then means deleting it, not
-    /// writing a zero.
-    /// </summary>
-    private static (int? Enable, string? Server) ReadSystemProxySettings()
-    {
-        if (!OperatingSystem.IsWindows()) return (null, null);
-
-        try
-        {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(InternetSettingsKey);
-            if (key is null) return (null, null);
-
-            return (key.GetValue("ProxyEnable") as int?, key.GetValue("ProxyServer") as string);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning("Could not read the current system proxy settings: {Reason}", ex.Message);
-            return (null, null);
-        }
-    }
-
-    /// <summary>Writes the recorded settings back. Returns false when there is nothing to write to.</summary>
-    private static bool RestoreSystemProxySettings((int? Enable, string? Server) original)
-    {
-        if (!OperatingSystem.IsWindows()) return false;
-
-        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(InternetSettingsKey, writable: true);
-        if (key is null) return false;
-
-        // A value that was absent before is deleted rather than written as zero or empty, so the
-        // machine ends up in the state it was actually in, not an equivalent-looking one.
-        if (original.Enable is { } enable)
-            key.SetValue("ProxyEnable", enable, Microsoft.Win32.RegistryValueKind.DWord);
-        else
-            key.DeleteValue("ProxyEnable", throwOnMissingValue: false);
-
-        if (original.Server is { } server)
-            key.SetValue("ProxyServer", server, Microsoft.Win32.RegistryValueKind.String);
-        else
-            key.DeleteValue("ProxyServer", throwOnMissingValue: false);
-
-        NotifySystemProxyChanged();
-        return true;
-    }
-
-    /// <summary>
-    /// Tells Windows the proxy settings changed. Without it the registry is correct but every
-    /// already-running application carries on using the values it read at startup, so the user sees
-    /// no change and reasonably concludes the repair did not work.
-    /// </summary>
-    private static void NotifySystemProxyChanged()
-    {
-        if (!OperatingSystem.IsWindows()) return;
-
-        try
-        {
-            Internet.InternetSetOption(IntPtr.Zero, Internet.OptionSettingsChanged, IntPtr.Zero, 0);
-            Internet.InternetSetOption(IntPtr.Zero, Internet.OptionRefresh, IntPtr.Zero, 0);
-        }
-        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
-        {
-            // Nothing to notify. The registry write already happened, which is the part that lasts,
-            // and this must never be the reason a restore is reported as having failed.
-        }
-    }
-
-    /// <summary>
-    /// Name of the machine-wide claim on the system proxy settings. Session-scoped, because the
-    /// settings it guards live in HKCU and are per-login.
-    /// </summary>
-    private const string SystemProxyOwnershipName = @"Local\ReqTree.SystemProxyOwner";
-
-    /// <summary>Held for as long as this process owns the machine's proxy settings.</summary>
-    private Semaphore? _systemProxyOwnership;
-
-    /// <summary>
-    /// Claims the right to change the machine's proxy settings, or reports that someone else has it.
-    /// </summary>
-    /// <remarks>
-    /// Two ReqTrees started together used to corrupt the settings between them, and the failure was
-    /// delayed and confusing. The first records the real original and points the machine at itself.
-    /// The second then reads *that* as the original — proxy on, pointing at the first one's port —
-    /// and faithfully restores it on the way out. Whichever stops last wins, and if that is the
-    /// second, the machine is left pointing at a port nothing is listening on. The user sees the
-    /// internet stop working, long after the thing that broke it.
-    ///
-    /// A named semaphore rather than a mutex: a mutex belongs to the thread that took it and must be
-    /// released by that same thread, and here it is claimed on whichever thread called TryStart and
-    /// released on whichever one calls Stop. A semaphore has no such affinity. When the owner dies
-    /// its handle closes with it, and once the last handle is gone the kernel object goes too — so a
-    /// crash frees the claim rather than blocking every future run.
-    /// </remarks>
-    private bool TryClaimSystemProxyOwnership()
-    {
-        if (_systemProxyOwnership is not null) return true;
-
-        try
-        {
-            var claim = new Semaphore(initialCount: 1, maximumCount: 1, name: SystemProxyOwnershipName);
-
-            if (!claim.WaitOne(TimeSpan.Zero))
-            {
-                claim.Dispose();
-                return false;
-            }
-
-            _systemProxyOwnership = claim;
-            return true;
-        }
-        catch (Exception ex) when (
-            ex is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException
-                or PlatformNotSupportedException)
-        {
-            // Cannot arbitrate. Carrying on is the lesser evil: refusing here would stop a single,
-            // perfectly ordinary ReqTree from working at all, to guard against a second one that
-            // usually is not there. Said out loud so it is not a silent loss of protection.
-            Log.Warning(ex,
-                "Could not check whether another ReqTree owns the system proxy settings, so this "
-                + "one is proceeding as though it does not. If two are running, stopping them in "
-                + "the wrong order can leave the machine pointed at a dead port.");
-
-            return true;
-        }
-    }
-
-    /// <summary>Gives up the claim, once the settings have actually been put back.</summary>
-    private void ReleaseSystemProxyOwnership()
-    {
-        var claim = Interlocked.Exchange(ref _systemProxyOwnership, null);
-        if (claim is null) return;
-
-        try
-        {
-            claim.Release();
-        }
-        catch (SemaphoreFullException)
-        {
-            // Already released. Nothing to undo, and not worth reporting.
-        }
-        finally
-        {
-            claim.Dispose();
-        }
-    }
-
-    /// <summary>Records that this process has taken over the system proxy.</summary>
-    private void RecordProxyState((int? Enable, string? Server) original)
-    {
-        try
-        {
-            var marker = new ProxyStateMarker(
-                System.Environment.ProcessId,
-                new DateTimeOffset(System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime()),
-                Port, original.Enable, original.Server);
-
-            File.WriteAllText(DirectoryManager.ProxyStateFilePath, JsonSerializer.Serialize(marker));
-        }
-        catch (Exception ex)
-        {
-            // Failing to write the marker is not worth refusing to start over. It costs only the
-            // automatic cleanup on the next run, not anything about this one. A broad catch is
-            // deliberate: WriteAllText can fail with UnauthorizedAccessException or
-            // NotSupportedException as well as IOException, and none of them is a reason to tear
-            // down a proxy that is already running.
-            Log.Warning("Could not record proxy state: {Reason}", ex.Message);
-        }
-    }
-
-    /// <summary>Clears the marker, once the system proxy has actually been restored.</summary>
-    private static void ClearProxyState()
-    {
-        try
-        {
-            if (File.Exists(DirectoryManager.ProxyStateFilePath))
-                File.Delete(DirectoryManager.ProxyStateFilePath);
-        }
-        catch (IOException)
-        {
-            // A leftover file is harmless: the next startup checks whether the process is alive
-            // before acting on it.
-        }
-    }
-
-    /// <summary>
-    /// Returns the marker left by a run that is no longer alive, or null when there is nothing
-    /// stale to undo.
-    /// </summary>
-    private static ProxyStateMarker? FindStaleProxyState()
-    {
-        try
-        {
-            if (!File.Exists(DirectoryManager.ProxyStateFilePath)) return null;
-
-            var marker = JsonSerializer.Deserialize<ProxyStateMarker>(
-                File.ReadAllText(DirectoryManager.ProxyStateFilePath));
-
-            if (marker is null) return null;
-
-            // Our own marker is not stale. This matters when a second ReqTree starts while the
-            // first is still running.
-            if (marker.ProcessId == System.Environment.ProcessId) return null;
-
-            return IsMarkerProcessAlive(marker) ? null : marker;
-        }
-        catch (Exception ex) when (ex is IOException or JsonException)
-        {
-            // An unreadable marker tells us nothing, and guessing would risk undoing a proxy
-            // setting ReqTree never made.
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// True when the process that wrote the marker is still alive.
-    /// </summary>
-    /// <remarks>
-    /// The id alone is not enough: Windows reuses process ids, so <see cref="Process.GetProcessById"/>
-    /// can succeed for a different process long after the one that wrote the marker is gone. The
-    /// recorded start time is what tells them apart — it never matches across two processes. When it
-    /// cannot be read (for example an elevated process), the safe answer is "still alive": repairing
-    /// the settings against a ReqTree that is actually running would be the worse mistake.
-    /// </remarks>
-    private static bool IsMarkerProcessAlive(ProxyStateMarker marker)
-    {
-        try
-        {
-            using var process = System.Diagnostics.Process.GetProcessById(marker.ProcessId);
-            return !process.HasExited
-                && process.StartTime.ToUniversalTime() == marker.StartedAt.UtcDateTime;
-        }
-        catch (ArgumentException)
-        {
-            // No such process — exactly the case this method exists to detect.
-            return false;
-        }
-        catch (InvalidOperationException)
-        {
-            // Exited between the lookup and the start-time read.
-            return false;
-        }
-        catch (Win32Exception)
-        {
-            // A process is there but its start time is unreadable. Assume it is still ours.
-            return true;
-        }
-    }
 }
