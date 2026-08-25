@@ -263,14 +263,18 @@ public class ReqTreeOptions
           --no-cert-trust    Do not install the root certificate into the trust store
           -h, --help         Show this help
 
-        CONNECTING AN LLM
+        CONNECTING AN MCP CLIENT
 
-          claude mcp add --transport http reqtree http://localhost:9999
+          Add a remote HTTP MCP server in your LLM client's settings:
+            name:      reqtree
+            transport: Streamable HTTP (some clients call this simply HTTP)
+            URL:       http://127.0.0.1:9999
+            headers:   none
 
-        Register that once. It is a URL, not a process, so it keeps working when ReqTree restarts -
-        you do not re-add it. Start ReqTree before the LLM session, and keep --mcp-port stable or
-        the registration points at the wrong port. Any MCP client that speaks Streamable HTTP works;
-        no bridge process is needed. The server listens on 127.0.0.1 only.
+        Any client that supports HTTP MCP can connect. There is no bridge process or client-side
+        command to run. Start ReqTree before connecting, then call get_proxy_status to verify it.
+        Keep the URL's port in sync with --mcp-port. The server listens on 127.0.0.1 only, so the
+        client must run on this machine.
 
         NOTES WORTH KNOWING
 

@@ -1,141 +1,119 @@
 # ReqTree
 
-A system-wide HTTP/HTTPS capture proxy with no GUI. It intercepts traffic from the whole machine and
-exposes it to any LLM over MCP. **The LLM is the interface** — ReqTree supplies the data and the
-controls; the reasoning happens on the other end.
+ReqTree is a no-GUI HTTP/HTTPS capture proxy. It captures traffic in memory and exposes it to an
+LLM through MCP; the LLM is the interface for inspecting, saving, and changing traffic.
 
----
+## Quick start — the normal setup
 
-## Starting it
+Install the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0), then build once from
+the repository root:
 
-Needs the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0). Build once, from the
-repository root:
-
-```
+```powershell
 dotnet build ReqTree.sln
 ```
 
-The binary lands at `src\ReqTree\bin\Debug\net10.0\reqtree.exe`. Put that on your PATH if you intend
-to point other tools at it, then pick a mode.
+Start ReqTree with its default, system-wide setup:
 
-Everything below is also available from `reqtree help`, which is self-contained — no repository and
-no running server needed. That is the thing to point an LLM at when it has to choose its own
-arguments.
-
-### The usual one — capture everything on this machine
-
+```powershell
+.\src\ReqTree\bin\Debug\net10.0\reqtree.exe start
 ```
+
+Or, after putting `reqtree.exe` on your `PATH`:
+
+```powershell
 reqtree start
 ```
 
-Points the machine's proxy settings at ReqTree, installs the root certificate into the current
-user's trust store on first run, and starts recording. Every browser and app on the machine goes
-through it. **Ctrl+C to stop** — that is what restores the proxy settings, so use it rather than
-closing the window or killing the process.
+This is the simplest mode. ReqTree trusts its root certificate for the current user, points the
+machine's proxy settings at itself, and starts recording traffic from browsers and applications.
+Use **Ctrl+C** to stop it cleanly; that restores the previous system-proxy settings.
 
-### Capture without touching the machine
+Then add ReqTree as an HTTP MCP server in your LLM client's MCP settings. The portable connection
+details are in [Connecting an MCP client](#connecting-an-mcp-client).
 
-```
-reqtree start --no-system-proxy --no-cert-trust
-```
+## Commands
 
-Listens on the port and changes nothing else. Point a client at it yourself
-(`curl -x http://localhost:8888`). The root certificate is still exported to
-`%LOCALAPPDATA%\ReqTree\reqtree-root.cer` so you can hand it to that client. Use this when you only
-want one program's traffic, or when you do not want a trust prompt.
-
-### Just the tools, no interception yet
-
-```
-reqtree start --no-proxy
-```
-
-Brings up the MCP server alone. The proxy can be started later with the `start_proxy` tool, without
-restarting. Useful when you want an LLM connected and ready before deciding what to record.
-
-### Read a saved capture
-
-```
-reqtree open C:\path\to\capture.reqtree
-```
-
-A detached session: nothing is intercepted or recorded, and the read tools are pointed at the file.
-Pass `capture='<file name without extension>'` to any read tool.
-
-### Everything else
-
-```
-reqtree help
-```
-
-Options take their value with `=`, e.g. `--mcp-port=9000`. The ones worth knowing:
-
-| Option | What it does |
+| Command | Purpose |
 |---|---|
-| `--port=8888` | Port the capture proxy listens on |
-| `--mcp-port=9999` | Port the MCP server listens on |
-| `--console-view` | Print one line per exchange, live, for a human watching |
-| `--paused` | Start with recording off; traffic flows but is not kept |
-| `--buffer=5000` | Exchanges held in memory; past this the oldest are dropped (0 = unlimited) |
-| `--buffer-mb=512` | Approximate ceiling on captured bodies (0 = unlimited) |
-| `--stop-after=n` | Stop recording after n exchanges |
+| `reqtree start [options]` | Start MCP and, by default, the system-wide capture proxy. |
+| `reqtree open <file.reqtree>` | Open a saved capture for reading; it does not intercept or record traffic. |
+| `reqtree help` | Print the built-in manual. It works without a repository or a running server. |
 
----
+## Start options
 
-## Connecting an LLM
+Option values always use `=`, for example `--mcp-port=9000`.
 
-Register the server **once**:
+| Option | Default | Purpose |
+|---|---:|---|
+| `--port=<n>` | `8888` | TCP port for the capture proxy. |
+| `--mcp-port=<n>` | `9999` | TCP port for the localhost MCP server. |
+| `--console-view` | off | Print one summary line per completed exchange. |
+| `--paused` | off | Start the proxy with recording off. Traffic, rules, and scripts still run. |
+| `--buffer=<n>` | `5000` | Maximum exchanges held in memory; drops the oldest when full. `0` is unlimited. |
+| `--buffer-mb=<n>` | `512` | Approximate body-memory limit in MB; drops the oldest when full. `0` is unlimited. |
+| `--stop-after=<n>` | unlimited | Stop recording after this many exchanges. Traffic continues to flow. |
+| `--no-proxy` | off | Start MCP only. Start interception later with the `start_proxy` MCP tool. |
+| `--no-system-proxy` | off | Listen without changing the machine's proxy settings; configure one client manually. |
+| `--no-cert-trust` | off | Generate and export the root certificate without adding it to the current user's trust store. |
+| `-h` or `--help` | off | Show the built-in manual. `reqtree help` is the clearest form. |
 
-```
-claude mcp add --transport http reqtree http://localhost:9999
-```
+## Common start modes
 
-Add `--scope user` to make it available in every project rather than just the current one.
-
-That registration is a URL in your Claude config. It is **not** tied to a particular ReqTree
-process, so:
-
-- **You do not re-add it when ReqTree restarts.** Stop ReqTree, start it again on the same
-  `--mcp-port`, and the same registration keeps working.
-- **Start ReqTree before the Claude session**, or at least before the first tool call. The MCP
-  client connects when it needs the server; if nothing is listening on that port it reports the
-  server as unavailable, and you may need to reconnect that session once ReqTree is up.
-- **If you change `--mcp-port`, the registration is stale** — it points at the old port. Either keep
-  the port stable or re-add with the new one.
-
-Nothing else is needed. There is no bridge process: ReqTree speaks Streamable HTTP directly, and the
-server is bound to `127.0.0.1` only — it can start a system-wide intercepting proxy, so it has no
-business being reachable from the network.
-
-Several sessions can be connected at once. They share one capture, one set of rules, and one log,
-and every change is attributed — see `get_logs`.
-
----
-
-## Where things end up
-
-Everything lives under `%LOCALAPPDATA%\ReqTree`:
-
-| | |
+| Goal | Command |
 |---|---|
-| `reqtree-root.pfx` / `.cer` | The MITM root certificate, generated once and reused |
-| `logs\reqtree-YYYYMMDD.log` | What ReqTree did, kept for seven days. `get_logs` reads this |
-| `proxy-state.json` | Present only while ReqTree owns the machine's proxy settings |
+| Capture everything on this machine | `reqtree start` |
+| Capture one manually configured client | `reqtree start --no-system-proxy --no-cert-trust` |
+| Connect an LLM before intercepting traffic | `reqtree start --no-proxy` |
+| Start recording only when asked | `reqtree start --paused` |
+| Read an earlier capture | `reqtree open C:\path\to\capture.reqtree` |
 
-**Captured traffic is not here.** It lives in memory and reaches disk only when someone calls
-`save_capture`. A capture is lost when the process exits unless it was saved.
+For manual-client mode, point the client at `http://localhost:8888`. The root certificate is still
+exported to `%LOCALAPPDATA%\ReqTree\reqtree-root.cer` so that client can trust HTTPS traffic.
 
-## If the internet stops working
+## Connecting an MCP client
 
-ReqTree points the machine's proxy settings at itself. If it dies without restoring them — a hard
-kill, a crash, a power cut — every application is left pointed at a port nothing is listening on.
+ReqTree speaks Streamable HTTP directly, so any LLM client that supports HTTP MCP servers can use
+it. There is no bridge process and no command to run from the client configuration.
 
-**Run `reqtree start` again.** It detects the state left behind and puts the settings back before
-doing anything else. The `clean_stale_proxy_state` tool does the same thing on demand. Failing both,
-the settings are under Internet Options → Connections → LAN settings.
+1. Start ReqTree: `reqtree start`.
+2. Open your LLM client's MCP-server settings and add a remote HTTP server.
+3. Enter these values:
 
-## For LLMs reading this repo
+   | Setting | Value |
+   |---|---|
+   | Name | `reqtree` |
+   | Transport | Streamable HTTP (some clients label this simply **HTTP**) |
+   | URL | `http://127.0.0.1:9999` |
+   | Authentication / headers | None |
 
-`AGENTS.md` is the orientation: architecture, the traps, and the house rules. `DECISIONS.md` says why
-each choice was made. `PROGRESS.md` is the status and the list of bugs already found, which is worth
-reading before assuming something is broken.
+4. Save or reconnect the MCP client, then call `get_proxy_status` to confirm it is connected.
+
+Keep the URL's port in sync with `--mcp-port`. For example, if ReqTree starts with
+`--mcp-port=9000`, configure `http://127.0.0.1:9000` instead. The endpoint is loopback-only, so the
+client must run on the same machine as ReqTree.
+
+Several LLM sessions can connect at once; they share one capture, one set of rules and scripts, and
+one coordination log. `get_logs` shows who changed what.
+
+## Data and recovery
+
+ReqTree stores its certificate, logs, and proxy-recovery marker in `%LOCALAPPDATA%\ReqTree`:
+
+| Path | Contents |
+|---|---|
+| `reqtree-root.pfx` / `reqtree-root.cer` | The generated MITM root certificate. |
+| `logs\reqtree-YYYYMMDD.log` | The activity log read by `get_logs`. |
+| `proxy-state.json` | Present only while ReqTree owns the system-proxy settings. |
+
+Captured traffic is **not** written there automatically. It lives in memory until `save_capture` is
+called, and is lost when ReqTree exits if it was not saved.
+
+If the internet appears to stop after a crash or hard kill, run `reqtree start` again. ReqTree sees
+the stale recovery marker and restores the prior system-proxy settings before starting. The
+`clean_stale_proxy_state` tool provides the same repair on demand.
+
+## For contributors and LLMs
+
+`AGENTS.md` explains the architecture and repository rules. `DECISIONS.md` explains key tradeoffs.
+`PROGRESS.md` records the current state and prior bugs. Keep this README and `reqtree help` aligned
+whenever the CLI changes.

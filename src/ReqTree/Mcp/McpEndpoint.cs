@@ -80,7 +80,7 @@ public static class McpEndpoint
         }
 
         Log.Information("MCP server listening on http://localhost:{Port}", port);
-        Log.Information("  claude mcp add --transport http reqtree http://localhost:{Port}", port);
+        Log.Information("  Add an HTTP MCP server at http://127.0.0.1:{Port}", port);
 
         return app;
     }
