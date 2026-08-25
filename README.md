@@ -20,6 +20,10 @@ Rules run first and are the simple, declarative option. Scripts are the escape h
 locally by assigning `exchange.StatusCode` and `exchange.ResponseBody`. A `before_response` script
 can rewrite the status, headers, or body delivered to the client.
 
+This also makes ReqTree useful for API testing: an LLM can capture a real flow, identify its
+contract, generate a client or test cases from the evidence, and use rules or scripts to exercise
+success, failure, and edge-case responses.
+
 Headers and bodies must be **assigned**, not mutated in place. For example, assign a new header list
 with `exchange.RequestHeaders = [...]`; do not cast and edit the existing list. Call
 `describe_script_format` before asking an LLM to write its first script.
@@ -73,8 +77,8 @@ an untrusted service or commit it to source control.
 
 ReqTree gives the LLM the captured exchanges. It can inspect their order, URLs, methods, request
 and response JSON, headers, cookies, token transitions, and error responses, then generate a small
-client, test service, API schema, fixtures, or mock from that evidence. Save the evidence when you
-are done: **“Save this capture as `example-sign-in`.”**
+client, API test suite, test service, schema, fixtures, or mock from that evidence. Save the
+evidence when you are done: **“Save this capture as `example-sign-in`.”**
 
 One capture proves only the path you performed. Capture extra flows deliberately for other roles,
 errors, device checks, or permissions before asking the LLM to broaden the implementation.
