@@ -56,6 +56,41 @@ Use **Ctrl+C** to stop it cleanly; that restores the previous system-proxy setti
 Then add ReqTree as an HTTP MCP server in your LLM client's MCP settings. The portable connection
 details are in [Connecting an MCP client](#connecting-an-mcp-client).
 
+## Examples
+
+### Capture a sign-in flow and build a client
+
+Use this only for a website, account, and traffic you are authorized to inspect. Captures can
+contain passwords, cookies, bearer tokens, and personal data; do not send an unredacted capture to
+an untrusted service or commit it to source control.
+
+1. Tell the LLM: **“Start a fresh capture for `example.com`; clear any existing exchanges first.”**
+2. In your browser or app, load the site, sign in with a test account, open an authenticated page,
+   then sign out.
+3. Tell the LLM: **“I have completed the sign-in flow. Stop capturing and recreate the observed
+   website auth flow as an API client. Use placeholders for credentials and secrets, do not reuse
+   captured tokens, and do not invent endpoints.”**
+
+ReqTree gives the LLM the captured exchanges. It can inspect their order, URLs, methods, request
+and response JSON, headers, cookies, token transitions, and error responses, then generate a small
+client, test service, API schema, fixtures, or mock from that evidence. Save the evidence when you
+are done: **“Save this capture as `example-sign-in`.”**
+
+One capture proves only the path you performed. Capture extra flows deliberately for other roles,
+errors, device checks, or permissions before asking the LLM to broaden the implementation.
+
+### Modify traffic with a plain-language request
+
+For simple changes, ask directly. For example, while testing your own site, say:
+
+> **“For requests to `api.example.com`, add the request header `X-Test-Mode: true`. Keep capturing
+> so I can see the result, and tell me how to undo the change.”**
+
+The LLM can create a matching rule and later disable or remove it. You can ask for other bounded
+changes in the same way: block an analytics host, redirect a test endpoint, redact a request field,
+or mock a known endpoint with a test response. For conditional or computed changes, ask it to write
+a script; ReqTree can run one before a request leaves or before a response reaches the client.
+
 ## Commands
 
 | Command | Purpose |
@@ -119,36 +154,6 @@ client must run on the same machine as ReqTree.
 
 Several LLM sessions can connect at once; they share one capture, one set of rules and scripts, and
 one coordination log. `get_logs` shows who changed what.
-
-## Example: capture and recreate an observed API or sign-in flow
-
-Use this only for a website, account, and traffic you are authorized to inspect. Captures can
-contain passwords, cookies, bearer tokens, and personal data; do not send an unredacted capture to
-an untrusted service or commit it to source control.
-
-1. Start ReqTree and connect an MCP-capable LLM client.
-2. Ask the LLM to call `clear_all_exchanges`, then `start_capture`.
-3. In the browser or app, perform the narrow flow you want to understand: for example, load the
-   site, sign in with a test account, refresh the authenticated page, and sign out.
-4. Ask the LLM to call `stop_capture`, `get_stats`, and `get_all_exchanges`. It can use
-   `search_exchanges` to narrow to the site's host or `/api/` paths, then use
-   `get_exchange_detail` on the important requests.
-5. Ask the LLM to produce an endpoint map and an implementation from the evidence. A useful prompt
-   is:
-
-   > Treat the captured exchanges as the source of truth. Map the observed requests in order,
-   > including methods, URLs, request/response JSON shapes, required headers, cookies or token
-   > transitions, error responses, and the point at which the session becomes authenticated. Then
-   > generate a small client or test service that reproduces this **observed flow** using placeholders
-   > for credentials and secrets. Do not invent endpoints or reuse captured tokens.
-
-6. Save the evidence with `save_capture` before making further changes. The LLM can then generate a
-   replay client, an API schema, test fixtures, or a mock service from the observed sequence.
-
-An ordinary capture only proves what happened in that run. It can recreate the observed API surface
-or auth flow, not guarantee it has discovered every endpoint, permission branch, device check, or
-server-side rule. Capture additional flows deliberately, then have the LLM compare the saved
-captures before broadening the implementation.
 
 ## Data and recovery
 
