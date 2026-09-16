@@ -42,6 +42,8 @@ try
         options.ProxyPort,
         registerAsSystemProxy: !options.NoSystemProxy,
         installCertificateTrust: !options.NoCertificateTrust,
+        installMachineCertificateTrust: options.MachineCertificateTrust,
+        networkPort: options.NetworkPort,
         capture: new ExchangeStore(
             capacity: options.BufferSize,
             maxBytes: options.MaxBufferBytes,
@@ -62,6 +64,16 @@ try
     if (options.StartPaused)
         Log.Warning("Recording is PAUSED (--paused). Traffic will flow and rules and scripts will "
                   + "run, but nothing is kept until start_capture is called.");
+
+    if (options.MachineCertificateTrust)
+        Log.Warning("Certificate trust is machine-wide (the default) and persists after ReqTree "
+                  + "exits. In manual-client mode Windows may request elevation for the "
+                  + "certificate operation alone.");
+
+    if (!options.NoSystemProxy)
+        Log.Warning("System-wide network capture is the default. ReqTree must be run as "
+                  + "administrator while it is active; it redirects local IPv4 TCP ports 80 and "
+                  + "443. IPv6, UDP and QUIC continue normally and are not captured.");
 
     // Before anything else: if a previous run died without restoring the machine's proxy settings,
     // undo that now. Leaving it would point every application on the machine at a port nothing is

@@ -264,7 +264,9 @@ public sealed class ExchangeStore
 
     /// <summary>What an exchange costs us, near enough. Bodies dominate; the rest is noise.</summary>
     private static long BodyBytes(Exchange exchange) =>
-        (exchange.RequestBody?.Length ?? 0) + (exchange.ResponseBody?.Length ?? 0);
+        (exchange.RequestBody?.Length ?? 0)
+        + (exchange.ResponseBody?.Length ?? 0)
+        + exchange.WebSocketFrameBytes;
 
     /// <summary>
     /// A copy of the exchanges as they stand, oldest first. Queries run over this rather than over
@@ -320,7 +322,8 @@ public sealed class ExchangeStore
         ResponseHeaders = 4,
         RequestBody = 8,
         ResponseBody = 16,
-        All = Url | RequestHeaders | ResponseHeaders | RequestBody | ResponseBody,
+        WebSocketFrames = 32,
+        All = Url | RequestHeaders | ResponseHeaders | RequestBody | ResponseBody | WebSocketFrames,
     }
 
     /// <summary>Exchanges containing <paramref name="keyword"/> in the chosen places.</summary>
@@ -353,6 +356,11 @@ public sealed class ExchangeStore
 
         if (where.HasFlag(SearchIn.ResponseBody) && exchange.ResponseBodyText.Contains(keyword, ci))
             return true;
+
+        if (where.HasFlag(SearchIn.WebSocketFrames))
+            foreach (var frame in exchange.WebSocketFrames)
+                if (frame.Text?.Contains(keyword, ci) is true)
+                    return true;
 
         return false;
     }
@@ -494,7 +502,10 @@ public sealed class ExchangeStore
         return new CaptureStats(
             Total: all.Count,
             WithResponse: all.Count(e => e.HasResponse),
-            ApproximateBytes: all.Sum(e => (long)(e.RequestBody?.Length ?? 0) + (e.ResponseBody?.Length ?? 0)),
+            ApproximateBytes: all.Sum(e =>
+                (long)(e.RequestBody?.Length ?? 0)
+                + (e.ResponseBody?.Length ?? 0)
+                + e.WebSocketFrameBytes),
             MedianDurationMs: Median([.. all.Where(e => e.DurationMs is not null).Select(e => e.DurationMs!.Value)]),
             FirstAt: all[0].StartedAt,
             LastAt: all[^1].StartedAt,

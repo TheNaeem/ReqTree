@@ -290,3 +290,49 @@ The extraction also made the local-answer path explicit: because Titanium never 
 hook for an answer supplied during `before_request`, the pipeline now updates the held exchange once
 that response is complete. It therefore records the local status, body, size, and completion time
 instead of leaving a response-looking exchange marked unfinished.
+
+## HTTP/2, WebSocket frames, and machine certificate trust (2026-09-15)
+
+HTTP/2 is enabled end to end, including RFC 8441 WebSockets, and both request and response protocol
+versions are exposed in exchange detail. Decoded WebSocket frames are attached to their upgrade
+exchange, bounded per frame/socket, searchable, visible in detail, counted against the memory cap,
+and preserved by capture format version 2. Version 1 captures still open normally.
+
+`--machine-cert-trust` adds ReqTree's own root CA to Local Machine trust as well as Current User
+trust. It requires elevation and deliberately persists after ReqTree exits. This does not add WFP
+or transparent network interception: clients that ignore Windows proxy settings still need to be
+configured explicitly.
+
+A live integration harness proved both WebSocket directions (`hello`/`world`), frame search, save
+and reopen, and an exact HTTP/2 request/response through ReqTree. The supplied Fiddler `.cer` was
+not imported because it contains no signing private key; ReqTree's existing root remained intact.
+
+## Machine trust becomes the default (2026-09-15)
+
+Following the Fiddler installation model, normal `reqtree start` now requests Local Machine trust
+for ReqTree's CA as well as Current User trust. Windows elevates only that certificate operation;
+the proxy process itself remains unelevated. `--user-cert-trust` is the current-user-only opt-out,
+`--no-cert-trust` installs no trust, and the earlier `--machine-cert-trust` spelling remains an
+accepted compatibility alias.
+
+## Opt-in WFP network capture (2026-09-15)
+
+Added `--network-capture`, backed by WinDivert, for Windows applications that bypass the system
+proxy. It redirects local IPv4 TCP ports 80 and 443 into a separate Titanium transparent endpoint,
+restores the original origin on return packets, and excludes ReqTree's own upstream sockets by PID.
+The packet handles start only after the listener and stop before it, and either loop failing closes
+both handles so normal networking resumes.
+
+The mode requires ReqTree to run as administrator while active. It deliberately leaves IPv6, UDP,
+QUIC, and certificate-pinned TLS untouched. `--network-port` selects the internal listener (8889 by
+default), and `get_proxy_status` reports whether the redirect is configured and actually active.
+The Debug build passes with zero warnings and errors; an elevated live traffic test remains.
+
+## WFP capture becomes the default (2026-09-15)
+
+The elevated live test captured Fortnite's previously missing core game traffic, including
+`QueryProfile?profileId=athena`, cosmetic inventory data, and XMPP WebSocket frames. System-wide WFP
+redirection is therefore now the normal `reqtree start` behavior rather than an opt-in flag.
+`--no-system-proxy` remains the explicit/manual-client mode and disables both WFP redirection and
+the Windows proxy change. ReqTree must run elevated in normal mode; avoiding that on every launch
+would require adding a persistent privileged service, which remains outside the one-process design.

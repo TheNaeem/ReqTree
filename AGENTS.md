@@ -16,7 +16,7 @@ HTTP exposes that store to any number of LLM clients. Nothing is distributed, th
 background service, and nothing is written to disk unless somebody asks for it.
 
 ```
-Titanium proxy -> rules -> scripts -> ExchangeStore (memory)
+system proxy / optional WinDivert redirect -> Titanium proxy -> rules -> scripts -> ExchangeStore (memory)
       |                                    |    ^
       v                                    v    |
  console view                    SQLite file (save / open)
@@ -31,6 +31,7 @@ Titanium proxy -> rules -> scripts -> ExchangeStore (memory)
 | `Program.cs` | Parse args, start the pieces, wait, stop cleanly. Nothing clever. |
 | `App/` | `ReqTreeOptions` (CLI), `DirectoryManager` (every path we write), `Logging` (Serilog setup). |
 | `Proxy/CaptureProxy.cs` | Titanium wiring, certs, system proxy, the two hooks, rules/scripts/environments/capture windows. |
+| `Proxy/NetworkRedirector.cs` | Optional Windows IPv4 TCP/80+443 redirect into Titanium's transparent listener. |
 | `Proxy/ExchangeStore.cs` | Where exchanges live, and every query over them. |
 | `Proxy/BehaviourList.cs` | The ordered, name-keyed collection rules and scripts are held in. |
 | `Proxy/ConsoleView.cs` | One line per exchange for a human watching. |
@@ -144,8 +145,9 @@ Keep those two in step when the CLI changes. They are the only instructions a se
 connected yet can read; the MCP server instructions are unreachable until it has.
 
 ```
-reqtree start                                        capture everything on this machine
-reqtree start --no-system-proxy --no-cert-trust      capture one client, machine untouched
+reqtree start                                        capture system-wide IPv4 web traffic (run elevated)
+reqtree start --user-cert-trust                      limit certificate trust to this account
+reqtree start --no-system-proxy --no-cert-trust      capture one explicit client, machine untouched
 reqtree start --no-proxy                             MCP only; start the proxy later from a tool
 reqtree open <file.reqtree>                          read a saved capture
 reqtree help

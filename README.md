@@ -1,14 +1,15 @@
 # ReqTree
 
-ReqTree is a no-GUI HTTP/HTTPS capture proxy. It captures traffic in memory and exposes it to an
-LLM through MCP; the LLM is the interface for inspecting, saving, and changing traffic. It is a
-data layer for understanding an API, not a GUI or an API client generator by itself.
+ReqTree is a no-GUI HTTP/HTTPS and WebSocket capture proxy. It captures HTTP/1.x and HTTP/2
+traffic plus decoded WebSocket frames in memory and exposes them to an LLM through MCP; the LLM is
+the interface for inspecting, saving, and changing traffic. It is a data layer for understanding
+an API, not a GUI or an API client generator by itself.
 
 ## What an LLM can do through ReqTree
 
 | Capability | MCP tools | What it enables |
 |---|---|---|
-| Inspect captured traffic | `get_stats`, `search_exchanges`, `get_exchange_detail` | Map endpoints, methods, headers, JSON bodies, status codes, and request order. |
+| Inspect captured traffic | `get_stats`, `search_exchanges`, `get_exchange_detail` | Map endpoints, methods, protocols, headers, JSON bodies, WebSocket frames, status codes, and request order. |
 | Control capture | `start_capture`, `stop_capture`, `capture_window`, `clear_*` | Keep only a reproduction or sign-in flow instead of background traffic. |
 | Save and compare sessions | `save_capture`, `open_capture`, `list_captures` | Preserve a useful capture or compare it with a later run. |
 | Change matching requests | `add_rule`, `list_rules`, `set_rule_enabled` | Block, mock, redirect, set or remove request headers, and redact request bodies. |
@@ -53,9 +54,11 @@ Or, after putting `reqtree.exe` on your `PATH`:
 reqtree start
 ```
 
-This is the simplest mode. ReqTree trusts its root certificate for the current user, points the
-machine's proxy settings at itself, and starts recording traffic from browsers and applications.
-Use **Ctrl+C** to stop it cleanly; that restores the previous system-proxy settings.
+This is the normal system-wide mode. Run it from an Administrator terminal: ReqTree trusts its root
+certificate for the current user and Local Machine, points the Windows proxy settings at itself,
+and uses a WFP-backed redirect for local IPv4 HTTP/HTTPS from applications that ignore those
+settings. ReqTree must remain elevated while this mode runs. Use **Ctrl+C** to stop it cleanly; that
+restores the previous proxy settings and closes the network redirect.
 
 Then add ReqTree as an HTTP MCP server in your LLM client's MCP settings. The portable connection
 details are in [Connecting an MCP client](#connecting-an-mcp-client).
@@ -123,21 +126,25 @@ Option values always use `=`, for example `--mcp-port=9000`.
 |---|---:|---|
 | `--port=<n>` | `8888` | TCP port for the capture proxy. |
 | `--mcp-port=<n>` | `9999` | TCP port for the localhost MCP server. |
+| `--network-port=<n>` | `8889` | Internal transparent-listener port used by normal system-wide capture. |
 | `--console-view` | off | Print one summary line per completed exchange. |
 | `--paused` | off | Start the proxy with recording off. Traffic, rules, and scripts still run. |
 | `--buffer=<n>` | `5000` | Maximum exchanges held in memory; drops the oldest when full. `0` is unlimited. |
 | `--buffer-mb=<n>` | `512` | Approximate body-memory limit in MB; drops the oldest when full. `0` is unlimited. |
 | `--stop-after=<n>` | unlimited | Stop recording after this many exchanges. Traffic continues to flow. |
 | `--no-proxy` | off | Start MCP only. Start interception later with the `start_proxy` MCP tool. |
-| `--no-system-proxy` | off | Listen without changing the machine's proxy settings; configure one client manually. |
-| `--no-cert-trust` | off | Generate and export the root certificate without adding it to the current user's trust store. |
+| `--no-system-proxy` | off | Manual-client mode: disable both the Windows proxy change and WFP redirect, then configure one client explicitly. |
+| `--no-cert-trust` | off | Generate and export the root certificate without adding it to any Windows trust store. |
+| `--user-cert-trust` | off | Trust the root only for the current account, avoiding elevation for certificate installation. Normal WFP capture still requires elevation. |
+| `--machine-cert-trust` | on | Compatibility alias; machine-wide trust is already the default. |
 | `-h` or `--help` | off | Show the built-in manual. `reqtree help` is the clearest form. |
 
 ## Common start modes
 
 | Goal | Command |
 |---|---|
-| Capture everything on this machine | `reqtree start` |
+| Capture system-wide HTTP/HTTPS traffic | `reqtree start` from an Administrator terminal |
+| Limit certificate trust to this account | `reqtree start --user-cert-trust` |
 | Capture one manually configured client | `reqtree start --no-system-proxy --no-cert-trust` |
 | Connect an LLM before intercepting traffic | `reqtree start --no-proxy` |
 | Start recording only when asked | `reqtree start --paused` |
@@ -145,6 +152,13 @@ Option values always use `=`, for example `--mcp-port=9000`.
 
 For manual-client mode, point the client at `http://localhost:8888`. The root certificate is still
 exported to `%LOCALAPPDATA%\ReqTree\reqtree-root.cer` so that client can trust HTTPS traffic.
+
+Machine-wide certificate trust is the default and persists after ReqTree exits. Normal capture also
+uses WinDivert's signed WFP driver to redirect local IPv4 TCP ports 80 and 443 into ReqTree's
+transparent listener, including applications that ignore Windows proxy settings. Windows requires
+ReqTree to remain elevated while this mode runs. It does not redirect IPv6, UDP, or QUIC, and it
+cannot decrypt certificate-pinned TLS clients. `--no-system-proxy` disables both machine-wide
+routing mechanisms for explicit/manual client configuration.
 
 ## Connecting an MCP client
 

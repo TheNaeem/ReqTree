@@ -56,6 +56,8 @@ public sealed class Exchange
 
     public int? StatusCode { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
+    /// <summary>The protocol spoken on the response side, which may differ after proxy translation.</summary>
+    public string? ResponseHttpVersion { get; set; }
     public IReadOnlyList<(string Name, string Value)>? ResponseHeaders { get; set; }
     public string? ResponseContentType { get; set; }
     public byte[]? ResponseBody
@@ -72,6 +74,54 @@ public sealed class Exchange
     /// even when the body itself was not stored.
     /// </summary>
     public long ResponseSizeBytes { get; set; }
+
+    // WebSocket frames arrive after the HTTP upgrade response and can arrive from both directions
+    // at once. Keep the mutable collection behind its own short lock so a read tool or save can
+    // snapshot it while the relay threads append without exposing a List during mutation.
+    private readonly Lock _webSocketSync = new();
+    private readonly List<CapturedWebSocketFrame> _webSocketFrames = [];
+    private long _webSocketFrameBytes;
+    private int _webSocketFramesOmitted;
+
+    /// <summary>Decoded WebSocket frames in arrival order.</summary>
+    public IReadOnlyList<CapturedWebSocketFrame> WebSocketFrames
+    {
+        get { lock (_webSocketSync) return [.. _webSocketFrames]; }
+    }
+
+    /// <summary>Payload bytes retained across all WebSocket frames on this exchange.</summary>
+    public long WebSocketFrameBytes
+    {
+        get { lock (_webSocketSync) return _webSocketFrameBytes; }
+    }
+
+    /// <summary>Frames omitted after this exchange reached its per-socket safety cap.</summary>
+    public int WebSocketFramesOmitted
+    {
+        get { lock (_webSocketSync) return _webSocketFramesOmitted; }
+        internal set { lock (_webSocketSync) _webSocketFramesOmitted = value; }
+    }
+
+    /// <summary>
+    /// Adds one frame if doing so stays inside the per-socket caps. Returns false when omitted.
+    /// </summary>
+    internal bool AddWebSocketFrame(
+        CapturedWebSocketFrame frame, int maxFrames = int.MaxValue, long maxBytes = long.MaxValue)
+    {
+        lock (_webSocketSync)
+        {
+            if (_webSocketFrames.Count >= maxFrames
+                || _webSocketFrameBytes + frame.Data.Length > maxBytes)
+            {
+                _webSocketFramesOmitted++;
+                return false;
+            }
+
+            _webSocketFrames.Add(frame);
+            _webSocketFrameBytes += frame.Data.Length;
+            return true;
+        }
+    }
 
     /// <summary>True once the response half has been filled in.</summary>
     public bool HasResponse => CompletedAt is not null;
@@ -157,4 +207,24 @@ public sealed class Exchange
             return null;
         }
     }
+}
+
+/// <summary>Direction of one captured WebSocket frame.</summary>
+public enum WebSocketFrameDirection
+{
+    ClientToServer,
+    ServerToClient,
+}
+
+/// <summary>One decoded WebSocket frame attached to its HTTP upgrade exchange.</summary>
+public sealed record CapturedWebSocketFrame(
+    DateTimeOffset CapturedAt,
+    WebSocketFrameDirection Direction,
+    string OpCode,
+    bool IsFinal,
+    byte[] Data,
+    bool DataTruncated)
+{
+    /// <summary>Payload as UTF-8 for text/continuation frames, or null for binary data.</summary>
+    public string? Text => OpCode is "Text" or "Continuation" ? Exchange.DecodeUtf8(Data) : null;
 }

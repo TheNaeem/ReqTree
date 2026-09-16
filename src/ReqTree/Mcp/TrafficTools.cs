@@ -87,13 +87,14 @@ public static class TrafficTools
         "Find exchanges containing a keyword. Search 'all' when hunting for a token or id and you "
         + "do not know where it appears - that is how you find every request carrying the same "
         + "value. Narrow to one place when the keyword is common enough to match noise. "
-        + "Case-insensitive substring matching; header names and values are both searched.")]
+        + "WebSocket text frames are searchable too. Case-insensitive substring matching; header "
+        + "names and values are both searched.")]
     public static string SearchExchanges(
         CaptureProxy proxy,
         [Description("The text to look for.")] string keyword,
         [Description(
             "Where to look: url, request_headers, response_headers, request_body, response_body, "
-            + "or all. Defaults to all.")]
+            + "websocket_frames, or all. Defaults to all.")]
         string search_in = "all",
         [Description(CaptureDescription)] string? capture = null)
     {
@@ -103,7 +104,7 @@ public static class TrafficTools
 
         if (ParseSearchIn(search_in) is not { } where)
             return $"'{search_in}' is not somewhere I can search. Use url, request_headers, "
-                 + "response_headers, request_body, response_body or all.";
+                 + "response_headers, request_body, response_body, websocket_frames or all.";
 
         var found = store.Search(keyword, where);
 
@@ -119,9 +120,9 @@ public static class TrafficTools
 
     [McpServerTool(Name = "get_exchange_detail")]
     [Description(
-        "Everything about one exchange: every header both ways, and both bodies in full. This is "
-        + "the only tool that returns bodies, so it is how you actually read a request or "
-        + "response once a search has pointed you at it.")]
+        "Everything about one exchange: protocols, every header both ways, both bodies, and any "
+        + "captured WebSocket frames. This is the only tool that returns payloads, so it is how "
+        + "you actually read an exchange once a search has pointed you at it.")]
     public static string GetExchangeDetail(
         CaptureProxy proxy,
         [Description("The exchange id, as shown in any of the listing tools.")] long id,
@@ -137,6 +138,10 @@ public static class TrafficTools
         report.AppendLine($"started_at: {exchange.StartedAt:O}");
         report.AppendLine($"status: {exchange.StatusCode?.ToString() ?? "(no response recorded)"}"
             + (exchange.DurationMs is { } ms ? $"   duration: {ms:F0}ms" : ""));
+        report.AppendLine($"protocol: HTTP/{exchange.HttpVersion}"
+            + (exchange.ResponseHttpVersion is { } responseVersion
+                ? $" request, HTTP/{responseVersion} response"
+                : " request"));
         report.AppendLine();
 
         report.AppendLine("--- request headers ---");
@@ -156,6 +161,12 @@ public static class TrafficTools
             report.AppendLine();
             report.AppendLine(BodySection("response", exchange.ResponseBody, exchange.ResponseBodyText,
                 exchange.ResponseBodyTruncated, exchange.ResponseContentType));
+        }
+
+        if (exchange.WebSocketFrames.Count > 0 || exchange.WebSocketFramesOmitted > 0)
+        {
+            report.AppendLine();
+            report.AppendLine(WebSocketSection(exchange));
         }
 
         return report.ToString().TrimEnd();
@@ -221,7 +232,7 @@ public static class TrafficTools
         report.AppendLine(proxy.IsRunning
             ? $"Proxy: listening on port {proxy.Port}. "
               + (proxy.IsSystemProxy
-                  ? "The machine's proxy settings point at ReqTree, so all traffic passes through it."
+                  ? "The Windows proxy settings point at ReqTree, so clients that honor them pass through it."
                   : "The machine's proxy settings were not changed, so only clients pointed here explicitly pass through.")
             : "Proxy: stopped. Nothing is being intercepted. Call start_proxy.");
 
@@ -230,13 +241,24 @@ public static class TrafficTools
             : $"Recording: off. {proxy.Capture.Count} exchange(s) held from earlier."
               + (proxy.Capture.StoppedByLimit ? " Recording stopped because a capture limit was reached." : ""));
 
+        report.AppendLine(!proxy.NetworkCaptureEnabled
+            ? "Network capture: disabled by manual-client mode (--no-system-proxy)."
+            : proxy.IsNetworkCaptureActive
+                ? $"Network capture: active on transparent port {proxy.NetworkPort}; local IPv4 "
+                  + "TCP/80 and TCP/443 are redirected. IPv6, UDP and QUIC are not captured."
+                : "Network capture: configured but NOT active. Run ReqTree as administrator and "
+                  + "start the proxy again.");
+
+        report.AppendLine($"Protocols: HTTP/1.x and HTTP/2; decoded WebSocket frames are retained. "
+            + $"Certificate trust: {proxy.CertificateTrustScope}.");
+
         // Said plainly, because an LLM that cannot find an exchange it saw earlier needs to know
         // the buffer dropped it rather than concluding capture is broken.
         var store = proxy.Capture;
         report.AppendLine(
             $"Buffer: {store.Count} held of "
             + (store.Capacity == 0 ? "unlimited" : $"{store.Capacity} max")
-            + $", ~{store.ApproximateBytes / 1024} KB of "
+            + $", ~{store.ApproximateBytes / 1024} KB of body and WebSocket payload data; ceiling "
             + (store.MaxBytes == 0 ? "unlimited" : $"{store.MaxBytes / 1024 / 1024} MB max")
             + $". {store.TotalSeen} recorded in total"
             + (store.Dropped > 0
@@ -516,7 +538,7 @@ public static class TrafficTools
 
         if (ParseSearchIn(search_in) is not { } where)
             return $"'{search_in}' is not somewhere I can search. Use url, request_headers, "
-                 + "response_headers, request_body, response_body or all.";
+                 + "response_headers, request_body, response_body, websocket_frames or all.";
 
         var who = Actor.Resolve(actor, mcpServer);
 
@@ -600,6 +622,7 @@ public static class TrafficTools
             "response_headers" => ExchangeStore.SearchIn.ResponseHeaders,
             "request_body" => ExchangeStore.SearchIn.RequestBody,
             "response_body" => ExchangeStore.SearchIn.ResponseBody,
+            "websocket" or "websocket_frames" => ExchangeStore.SearchIn.WebSocketFrames,
             "all" => ExchangeStore.SearchIn.All,
             _ => null,
         };
@@ -651,7 +674,11 @@ public static class TrafficTools
                 $"#{exchange.Id,-5} {exchange.StartedAt:HH:mm:ss} "
                 + $"{exchange.StatusCode?.ToString() ?? "---",-4} "
                 + $"{exchange.Method,-6} {exchange.Url} "
-                + $"[req {exchange.RequestBody?.Length ?? 0}b, resp {exchange.ResponseBody?.Length ?? 0}b"
+                + $"[HTTP/{exchange.HttpVersion}, req {exchange.RequestBody?.Length ?? 0}b, "
+                + $"resp {exchange.ResponseBody?.Length ?? 0}b"
+                + (exchange.WebSocketFrames.Count > 0
+                    ? $", ws {exchange.WebSocketFrames.Count} frame(s)"
+                    : "")
                 + (exchange.DurationMs is { } ms ? $", {ms:F0}ms]" : "]"));
 
         report.AppendLine();
@@ -671,6 +698,7 @@ public static class TrafficTools
     /// one of those whole would spend a context window on a single response.
     /// </summary>
     private const int MaxBodyShown = 20_000;
+    private const int MaxWebSocketShown = 20_000;
 
     private static string BodySection(
         string which, byte[]? body, string text, bool truncated, string? contentType)
@@ -696,5 +724,58 @@ public static class TrafficTools
         return $"{header}\n{text[..MaxBodyShown]}\n\n"
              + $"[... cut for display after {MaxBodyShown} of {text.Length} characters. The whole "
              + "body is still captured, and search_exchanges searches all of it.]";
+    }
+
+    private static string WebSocketSection(Exchange exchange)
+    {
+        var frames = exchange.WebSocketFrames;
+        var report = new StringBuilder();
+        report.AppendLine($"--- WebSocket frames: {frames.Count} retained"
+            + (exchange.WebSocketFramesOmitted > 0
+                ? $", {exchange.WebSocketFramesOmitted} OMITTED at the per-socket cap"
+                : "")
+            + " ---");
+
+        var shown = 0;
+        foreach (var frame in frames)
+        {
+            var arrow = frame.Direction is WebSocketFrameDirection.ClientToServer ? "client -> server" : "server -> client";
+            var prefix = $"{frame.CapturedAt:O}  {arrow}  {frame.OpCode}  {frame.Data.Length}b"
+                + (frame.IsFinal ? "  final" : "  continuation")
+                + (frame.DataTruncated ? "  TRUNCATED" : "");
+
+            string payload;
+            if (frame.Text is { } text)
+            {
+                var printable = string.Create(text.Length, text, (span, source) =>
+                {
+                    for (var i = 0; i < source.Length; i++)
+                        span[i] = char.IsControl(source[i]) && source[i] is not '\r' and not '\n' and not '\t'
+                            ? '.'
+                            : source[i];
+                });
+                payload = printable.Length <= 2_000 ? printable : printable[..2_000] + "…";
+            }
+            else
+            {
+                var bytes = Math.Min(frame.Data.Length, 256);
+                payload = bytes == 0
+                    ? "(empty payload)"
+                    : "base64: " + Convert.ToBase64String(frame.Data.AsSpan(0, bytes))
+                      + (bytes < frame.Data.Length ? "…" : "");
+            }
+
+            var block = prefix + System.Environment.NewLine + payload + System.Environment.NewLine;
+            if (report.Length + block.Length > MaxWebSocketShown) break;
+
+            report.Append(block);
+            shown++;
+        }
+
+        if (shown < frames.Count)
+            report.Append($"[... {frames.Count - shown} retained frame(s) omitted from display. "
+                + "Their full payloads remain searchable.]" + System.Environment.NewLine);
+
+        return report.ToString().TrimEnd();
     }
 }

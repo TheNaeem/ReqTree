@@ -30,6 +30,8 @@ public sealed class CaptureProxy : IAsyncDisposable
 {
     private readonly bool _registerAsSystemProxy;
     private readonly bool _installCertificateTrust;
+    private readonly bool _installMachineCertificateTrust;
+    private readonly int _networkPort;
     private readonly SystemProxyLease _systemProxy = new();
 
     /// <summary>Serialises start and stop, which can arrive concurrently once tools can call them.</summary>
@@ -37,6 +39,7 @@ public sealed class CaptureProxy : IAsyncDisposable
 
     /// <summary>Null whenever the proxy is stopped.</summary>
     private ProxyServer? _proxyServer;
+    private NetworkRedirector? _networkRedirector;
     private readonly CapturePipeline _pipeline;
     /// <summary>
     /// Everything this proxy has captured. The same shape a capture loaded from a file has, which
@@ -146,14 +149,37 @@ public sealed class CaptureProxy : IAsyncDisposable
     /// <summary>True when we have pointed the machine's proxy settings at ourselves.</summary>
     public bool IsSystemProxy => _systemProxy.IsTaken;
 
+    /// <summary>Whether this instance is configured to redirect clients below the proxy layer.</summary>
+    public bool NetworkCaptureEnabled => _registerAsSystemProxy;
+
+    /// <summary>True while the WFP-backed packet redirect is active.</summary>
+    public bool IsNetworkCaptureActive
+    {
+        get { lock (_lifecycleLock) return _networkRedirector?.IsRunning ?? false; }
+    }
+
+    /// <summary>Internal transparent-listener port used by network capture.</summary>
+    public int NetworkPort => _networkPort;
+
+    /// <summary>Where ReqTree asked Titanium to trust its generated root certificate.</summary>
+    public string CertificateTrustScope => !_installCertificateTrust
+        ? "none"
+        : _installMachineCertificateTrust ? "current user and local machine" : "current user";
+
     /// <param name="port">TCP port to listen on.</param>
     /// <param name="registerAsSystemProxy">
-    /// When false, ReqTree only listens and the caller points clients at it manually. Useful for
-    /// testing, and ignored on platforms with no system-wide proxy setting.
+    /// When false, ReqTree neither changes the Windows proxy settings nor redirects network
+    /// traffic. It only listens, and the caller points clients at it manually.
     /// </param>
     /// <param name="installCertificateTrust">
     /// When false, the root certificate is still generated and exported, but not added to this
     /// machine's trust store. Clients then have to be pointed at the exported .cer themselves.
+    /// </param>
+    /// <param name="networkPort">Internal port for the transparent proxy endpoint.</param>
+    /// <param name="installMachineCertificateTrust">
+    /// When true, the generated root is also trusted for the local machine. This requires an
+    /// elevated process (or approval of Titanium's elevation prompt) and the trust persists after
+    /// ReqTree exits, just like current-user trust.
     /// </param>
     /// <param name="capture">
     /// The store to record into, carrying whatever caps the command line asked for. Left null it is
@@ -163,11 +189,15 @@ public sealed class CaptureProxy : IAsyncDisposable
         int port,
         bool registerAsSystemProxy = true,
         bool installCertificateTrust = true,
+        bool installMachineCertificateTrust = true,
+        int networkPort = 8889,
         ExchangeStore? capture = null)
     {
         Port = port;
         _registerAsSystemProxy = registerAsSystemProxy;
         _installCertificateTrust = installCertificateTrust;
+        _installMachineCertificateTrust = installMachineCertificateTrust;
+        _networkPort = networkPort;
         Capture = capture ?? new ExchangeStore();
         _captures = new CaptureCatalog(Capture);
         _pipeline = new CapturePipeline(
@@ -200,16 +230,48 @@ public sealed class CaptureProxy : IAsyncDisposable
         {
             if (_proxyServer is not null && _proxyServer.ProxyRunning)
             {
+                if (_registerAsSystemProxy && !(_networkRedirector?.IsRunning ?? false))
+                {
+                    try
+                    {
+                        _networkRedirector?.Dispose();
+                        var replacement = new NetworkRedirector(_networkPort);
+                        replacement.Start();
+                        _networkRedirector = replacement;
+                        Log.Information("Network capture restarted on transparent port {Port}.",
+                            _networkPort);
+                    }
+                    catch (Exception ex)
+                    {
+                        _networkRedirector = null;
+                        Log.Error(ex, "The proxy is listening, but network capture could not be "
+                            + "restarted on transparent port {Port}.", _networkPort);
+                        return false;
+                    }
+                }
+
                 Log.Debug("Proxy is already listening on port {Port}.", Port);
                 return true;
             }
 
             ProxyServer? server = null;
+            NetworkRedirector? redirector = null;
 
             try
             {
                 server = BuildServer();
                 var endPoint = new ExplicitProxyEndPoint(IPAddress.Any, Port, decryptSsl: true);
+                TransparentProxyEndPoint? transparentEndPoint = null;
+
+                if (_registerAsSystemProxy)
+                {
+                    if (!OperatingSystem.IsWindowsVersionAtLeast(6, 0, 6000))
+                        throw new PlatformNotSupportedException(
+                            "Network capture is available only on Windows.");
+
+                    transparentEndPoint = new TransparentProxyEndPoint(
+                        IPAddress.Any, _networkPort, decryptSsl: true);
+                }
 
                 // Whether the .pfx already exists is our "is this a first run?" signal. Asking the
                 // certificate manager instead would mean querying a root certificate it has not
@@ -224,7 +286,19 @@ public sealed class CaptureProxy : IAsyncDisposable
                 ExportRootCertificate(server);
 
                 server.AddEndPoint(endPoint);
+                if (transparentEndPoint is not null)
+                    server.AddEndPoint(transparentEndPoint);
                 server.Start(changeSystemProxySettings: false);
+
+                // Start packet interception only after its destination is listening. Reversing
+                // this order creates a window where captured SYNs are redirected into a closed
+                // port. On shutdown the reverse order is used for the same reason.
+                if (_registerAsSystemProxy)
+                {
+                    redirector = new NetworkRedirector(_networkPort);
+                    redirector.Start();
+                    _networkRedirector = redirector;
+                }
 
                 // Only Windows has a system-wide proxy setting Titanium can write. Elsewhere the
                 // user points their client at us manually; capture works identically either way.
@@ -251,6 +325,21 @@ public sealed class CaptureProxy : IAsyncDisposable
             }
             catch (Exception ex)
             {
+                if (redirector is not null)
+                {
+                    try
+                    {
+                        redirector.Dispose();
+                    }
+                    catch (Exception cleanupFailure)
+                    {
+                        Log.Warning(cleanupFailure,
+                            "Could not clean up network capture after a failed proxy start.");
+                    }
+                }
+
+                _networkRedirector = null;
+
                 // Two separate attempts, not one. Sharing a try meant a registry failure skipped
                 // the teardown below it — leaving a half-started proxy still holding its listener
                 // and never disposed, on top of the settings being wrong. Each has to be able to
@@ -309,6 +398,21 @@ public sealed class CaptureProxy : IAsyncDisposable
         {
             var server = _proxyServer;
             if (server is null) return false;
+
+            // Stop intercepting before taking down the transparent listener. WinDivert handles
+            // are the switch: once closed, new packets continue to their real destinations.
+            var redirector = Interlocked.Exchange(ref _networkRedirector, null);
+            if (redirector is not null)
+            {
+                try
+                {
+                    redirector.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Network capture did not stop cleanly.");
+                }
+            }
 
             // Captured before the restore clears it, so the message below can say what actually
             // happened rather than claiming a restore that never took place.
@@ -837,14 +941,13 @@ public sealed class CaptureProxy : IAsyncDisposable
     }
 
     /// <summary>
-    /// The first flag asks Titanium to install our generated root CA into the *current user's*
-    /// trust store. Machine-wide trust would need an elevated process, and per-user is enough to
-    /// decrypt this user's own browsers and apps.
+    /// Titanium can elevate only the Local Machine certificate-store operation. That still helps
+    /// manual-client mode, where the process does not otherwise need administrator rights.
     /// </summary>
     private ProxyServer CreateServer() => new(
         userTrustRootCertificate: _installCertificateTrust,
-        machineTrustRootCertificate: false,
-        trustRootCertificateAsAdmin: false);
+        machineTrustRootCertificate: _installMachineCertificateTrust,
+        trustRootCertificateAsAdmin: _installMachineCertificateTrust);
 
     private void Configure(ProxyServer server)
     {
@@ -852,11 +955,14 @@ public sealed class CaptureProxy : IAsyncDisposable
         server.CertificateManager.RootCertificateIssuerName = "ReqTree";
         server.CertificateManager.PfxFilePath = DirectoryManager.RootCertificatePath;
 
-        // Set explicitly because 5.x defaults it on. Off means Titanium negotiates HTTP/1.1 over
-        // ALPN on the client-facing leg, so the capture hooks only ever see one wire format. This
-        // is the flag to revisit once capture can handle h2 framing — the library supports it, we
-        // do not yet, and turning it on before then would mean capturing traffic we cannot read.
-        server.EnableHttp2 = false;
+        // Titanium normalises HTTP/2 streams into the same request/response model the hooks use,
+        // including buffered bodies and modifications. Keeping it on preserves the negotiated
+        // protocol instead of forcing clients down to HTTP/1.1.
+        server.EnableHttp2 = true;
+
+        // Opt into RFC 8441 so WebSocket sessions can remain on HTTP/2 when both peers support it.
+        // Ordinary HTTP/1.1 Upgrade sessions continue to use the same decoded-frame hook.
+        server.EnableRfc8441 = true;
 
         // Titanium never throws from inside its own pipeline; it logs. Left alone it would write
         // its own coloured output straight to the console, which means two logging systems sharing

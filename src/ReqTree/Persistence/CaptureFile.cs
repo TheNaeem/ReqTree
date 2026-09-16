@@ -27,7 +27,7 @@ public static class CaptureFile
     /// rather than half-read, because a capture that silently loses columns is worse than one that
     /// will not open.
     /// </summary>
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
 
     private const string Schema =
         """
@@ -51,11 +51,25 @@ public static class CaptureFile
             request_body             BLOB,
             request_body_truncated   INTEGER NOT NULL,
             status_code              INTEGER,
+            response_http_version    TEXT,
             response_headers         TEXT,
             response_content_type    TEXT,
             response_body            BLOB,
             response_body_truncated  INTEGER NOT NULL,
-            response_size_bytes      INTEGER NOT NULL
+            response_size_bytes      INTEGER NOT NULL,
+            websocket_frames_omitted INTEGER NOT NULL
+        );
+
+        CREATE TABLE websocket_frames (
+            exchange_id    INTEGER NOT NULL,
+            sequence       INTEGER NOT NULL,
+            captured_at    TEXT    NOT NULL,
+            direction      TEXT    NOT NULL,
+            opcode         TEXT    NOT NULL,
+            is_final       INTEGER NOT NULL,
+            data           BLOB    NOT NULL,
+            data_truncated INTEGER NOT NULL,
+            PRIMARY KEY (exchange_id, sequence)
         );
 
         CREATE INDEX exchanges_host ON exchanges (host);
@@ -135,13 +149,15 @@ public static class CaptureFile
             INSERT INTO exchanges (
                 id, started_at, completed_at, method, url, host, path, query_string, http_version,
                 request_headers, request_content_type, request_body, request_body_truncated,
-                status_code, response_headers, response_content_type, response_body,
-                response_body_truncated, response_size_bytes)
+                status_code, response_http_version, response_headers, response_content_type,
+                response_body, response_body_truncated, response_size_bytes,
+                websocket_frames_omitted)
             VALUES (
                 $id, $started_at, $completed_at, $method, $url, $host, $path, $query_string,
                 $http_version, $request_headers, $request_content_type, $request_body,
-                $request_body_truncated, $status_code, $response_headers, $response_content_type,
-                $response_body, $response_body_truncated, $response_size_bytes);
+                $request_body_truncated, $status_code, $response_http_version, $response_headers,
+                $response_content_type, $response_body, $response_body_truncated,
+                $response_size_bytes, $websocket_frames_omitted);
             """;
 
         // Parameters created once and reassigned per row, rather than rebuilt each time.
@@ -150,8 +166,8 @@ public static class CaptureFile
             "$id", "$started_at", "$completed_at", "$method", "$url", "$host", "$path",
             "$query_string", "$http_version", "$request_headers", "$request_content_type",
             "$request_body", "$request_body_truncated", "$status_code", "$response_headers",
-            "$response_content_type", "$response_body", "$response_body_truncated",
-            "$response_size_bytes",
+            "$response_http_version", "$response_content_type", "$response_body",
+            "$response_body_truncated", "$response_size_bytes", "$websocket_frames_omitted",
         })
             insert.Parameters.Add(new SqliteParameter(name, DBNull.Value));
 
@@ -171,14 +187,52 @@ public static class CaptureFile
             insert.Parameters["$request_body"].Value = Null(exchange.RequestBody);
             insert.Parameters["$request_body_truncated"].Value = exchange.RequestBodyTruncated ? 1 : 0;
             insert.Parameters["$status_code"].Value = Null(exchange.StatusCode);
+            insert.Parameters["$response_http_version"].Value = Null(exchange.ResponseHttpVersion);
             insert.Parameters["$response_headers"].Value =
                 exchange.ResponseHeaders is null ? DBNull.Value : HeadersToJson(exchange.ResponseHeaders);
             insert.Parameters["$response_content_type"].Value = Null(exchange.ResponseContentType);
             insert.Parameters["$response_body"].Value = Null(exchange.ResponseBody);
             insert.Parameters["$response_body_truncated"].Value = exchange.ResponseBodyTruncated ? 1 : 0;
             insert.Parameters["$response_size_bytes"].Value = exchange.ResponseSizeBytes;
+            insert.Parameters["$websocket_frames_omitted"].Value = exchange.WebSocketFramesOmitted;
 
             insert.ExecuteNonQuery();
+        }
+
+        using var frameInsert = connection.CreateCommand();
+        frameInsert.Transaction = transaction;
+        frameInsert.CommandText =
+            """
+            INSERT INTO websocket_frames (
+                exchange_id, sequence, captured_at, direction, opcode, is_final, data,
+                data_truncated)
+            VALUES (
+                $exchange_id, $sequence, $captured_at, $direction, $opcode, $is_final, $data,
+                $data_truncated);
+            """;
+
+        foreach (var name in new[]
+        {
+            "$exchange_id", "$sequence", "$captured_at", "$direction", "$opcode", "$is_final",
+            "$data", "$data_truncated",
+        })
+            frameInsert.Parameters.Add(new SqliteParameter(name, DBNull.Value));
+
+        foreach (var exchange in exchanges)
+        {
+            var sequence = 0;
+            foreach (var frame in exchange.WebSocketFrames)
+            {
+                frameInsert.Parameters["$exchange_id"].Value = exchange.Id;
+                frameInsert.Parameters["$sequence"].Value = sequence++;
+                frameInsert.Parameters["$captured_at"].Value = frame.CapturedAt.ToString("o");
+                frameInsert.Parameters["$direction"].Value = frame.Direction.ToString();
+                frameInsert.Parameters["$opcode"].Value = frame.OpCode;
+                frameInsert.Parameters["$is_final"].Value = frame.IsFinal ? 1 : 0;
+                frameInsert.Parameters["$data"].Value = frame.Data;
+                frameInsert.Parameters["$data_truncated"].Value = frame.DataTruncated ? 1 : 0;
+                frameInsert.ExecuteNonQuery();
+            }
         }
 
         transaction.Commit();
@@ -209,48 +263,89 @@ public static class CaptureFile
         var store = new ExchangeStore();
 
         using var read = connection.CreateCommand();
+        var responseVersionColumn = parsed >= 2 ? "response_http_version" : "NULL";
+        var omittedColumn = parsed >= 2 ? "websocket_frames_omitted" : "0";
         read.CommandText =
-            """
+            $"""
             SELECT id, started_at, completed_at, method, url, host, path, query_string,
                    http_version, request_headers, request_content_type, request_body,
-                   request_body_truncated, status_code, response_headers, response_content_type,
-                   response_body, response_body_truncated, response_size_bytes
+                   request_body_truncated, status_code, {responseVersionColumn}, response_headers,
+                   response_content_type, response_body, response_body_truncated,
+                   response_size_bytes, {omittedColumn}
             FROM exchanges
             ORDER BY id;
             """;
 
-        using var reader = read.ExecuteReader();
-
-        while (reader.Read())
+        var loaded = new List<Exchange>();
+        using (var reader = read.ExecuteReader())
         {
-            var exchange = new Exchange
+            while (reader.Read())
             {
-                // Kept, not reissued, so an id quoted from this capture still means the same
-                // exchange the next time the file is opened. ExchangeStore moves its counter past
-                // whatever it is handed, so nothing captured later collides with it.
-                Id = reader.GetInt64(0),
-                StartedAt = ParseTimestamp(reader.GetString(1)),
-                CompletedAt = reader.IsDBNull(2) ? null : ParseTimestamp(reader.GetString(2)),
-                Method = reader.GetString(3),
-                Url = reader.GetString(4),
-                Host = reader.GetString(5),
-                Path = reader.GetString(6),
-                QueryString = reader.GetString(7),
-                HttpVersion = reader.GetString(8),
-                RequestHeaders = HeadersFromJson(reader.GetString(9)),
-                RequestContentType = reader.IsDBNull(10) ? null : reader.GetString(10),
-                RequestBody = reader.IsDBNull(11) ? null : (byte[])reader["request_body"],
-                RequestBodyTruncated = reader.GetInt32(12) != 0,
-                StatusCode = reader.IsDBNull(13) ? null : reader.GetInt32(13),
-                ResponseHeaders = reader.IsDBNull(14) ? null : HeadersFromJson(reader.GetString(14)),
-                ResponseContentType = reader.IsDBNull(15) ? null : reader.GetString(15),
-                ResponseBody = reader.IsDBNull(16) ? null : (byte[])reader["response_body"],
-                ResponseBodyTruncated = reader.GetInt32(17) != 0,
-                ResponseSizeBytes = reader.GetInt64(18),
-            };
+                var exchange = new Exchange
+                {
+                    // Kept, not reissued, so an id quoted from this capture still means the same
+                    // exchange the next time the file is opened. ExchangeStore moves its counter past
+                    // whatever it is handed, so nothing captured later collides with it.
+                    Id = reader.GetInt64(0),
+                    StartedAt = ParseTimestamp(reader.GetString(1)),
+                    CompletedAt = reader.IsDBNull(2) ? null : ParseTimestamp(reader.GetString(2)),
+                    Method = reader.GetString(3),
+                    Url = reader.GetString(4),
+                    Host = reader.GetString(5),
+                    Path = reader.GetString(6),
+                    QueryString = reader.GetString(7),
+                    HttpVersion = reader.GetString(8),
+                    RequestHeaders = HeadersFromJson(reader.GetString(9)),
+                    RequestContentType = reader.IsDBNull(10) ? null : reader.GetString(10),
+                    RequestBody = reader.IsDBNull(11) ? null : (byte[])reader["request_body"],
+                    RequestBodyTruncated = reader.GetInt32(12) != 0,
+                    StatusCode = reader.IsDBNull(13) ? null : reader.GetInt32(13),
+                    ResponseHttpVersion = reader.IsDBNull(14) ? null : reader.GetString(14),
+                    ResponseHeaders = reader.IsDBNull(15) ? null : HeadersFromJson(reader.GetString(15)),
+                    ResponseContentType = reader.IsDBNull(16) ? null : reader.GetString(16),
+                    ResponseBody = reader.IsDBNull(17) ? null : (byte[])reader["response_body"],
+                    ResponseBodyTruncated = reader.GetInt32(18) != 0,
+                    ResponseSizeBytes = reader.GetInt64(19),
+                    WebSocketFramesOmitted = reader.GetInt32(20),
+                };
 
-            store.AddExchange(exchange);
+                loaded.Add(exchange);
+            }
         }
+
+        if (parsed >= 2)
+        {
+            var byId = loaded.ToDictionary(exchange => exchange.Id);
+            using var frames = connection.CreateCommand();
+            frames.CommandText =
+                """
+                SELECT exchange_id, captured_at, direction, opcode, is_final, data, data_truncated
+                FROM websocket_frames
+                ORDER BY exchange_id, sequence;
+                """;
+
+            using var frameReader = frames.ExecuteReader();
+            while (frameReader.Read())
+            {
+                var exchangeId = frameReader.GetInt64(0);
+                if (!byId.TryGetValue(exchangeId, out var exchange)) continue;
+
+                var direction = Enum.TryParse<WebSocketFrameDirection>(frameReader.GetString(2), out var parsedDirection)
+                    ? parsedDirection
+                    : WebSocketFrameDirection.ClientToServer;
+
+                exchange.AddWebSocketFrame(new CapturedWebSocketFrame(
+                    ParseTimestamp(frameReader.GetString(1)),
+                    direction,
+                    frameReader.GetString(3),
+                    frameReader.GetInt32(4) != 0,
+                    (byte[])frameReader["data"],
+                    frameReader.GetInt32(6) != 0));
+            }
+        }
+
+        foreach (var exchange in loaded)
+            store.AddExchange(exchange);
 
         Log.Information("Opened {Path}: {Count} exchange(s).", path, store.Count);
         return store;

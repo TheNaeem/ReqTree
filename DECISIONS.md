@@ -126,9 +126,27 @@ capability is an interactive pause, which is exactly the part that fits an LLM b
 Titanium.Web.Proxy 5.x ships a `net10.0` target only, and 5.x is where WebSocket, HTTP/2 and HTTP/3
 support lives. Choosing it before the proxy layer was built avoided rewriting that layer later.
 
-`EnableHttp2` is explicitly set to **false**, because 5.x defaults it on and the capture hooks only
-handle HTTP/1.1 framing. Turning it on means capturing traffic we cannot read. That is the flag to
-revisit when h2 capture is actually built.
+`EnableHttp2` is explicitly set to **true**. Titanium normalises HTTP/2 requests and responses into
+the same model used by the existing hooks, including buffered bodies and modifications, so ReqTree
+records the negotiated request and response protocol without maintaining a second capture path.
+`EnableRfc8441` is also on so WebSocket sessions may remain on HTTP/2 when both peers support it.
+HTTP/3 remains off: enabling QUIC would require a transparent endpoint and a separate system-level
+routing story, not just another protocol flag.
+
+Decoded WebSocket frames belong to the HTTP upgrade exchange. Titanium's frame interception hook
+is attached before the upgrade is forwarded, then each frame snapshot updates that held exchange.
+The per-frame and per-socket caps prevent a long-lived stream from bypassing the store's normal
+memory ceiling. Capture files use format version 2 for response protocol and WebSocket frames;
+version 1 remains readable.
+
+### Machine certificate trust is the default
+
+ReqTree trusts its generated root in both Current User and Local Machine by default. Titanium asks
+Windows to elevate only the machine-store installation when the process itself is not elevated.
+This matters in manual-client mode; normal WFP-backed capture independently requires an elevated
+process for the whole run. The trust persists until explicitly removed. `--user-cert-trust` limits
+it to Current User and `--no-cert-trust` installs neither; `--machine-cert-trust` remains accepted
+for compatibility.
 
 ### Titanium logs through Serilog
 
@@ -154,3 +172,17 @@ execution, `CaptureCatalog` for live and file-backed capture names, and `SystemP
 Windows registry, marker, and semaphore. They are concrete classes, not hypothetical interfaces:
 there is one SQLite implementation and one Windows system-proxy mechanism, so an abstraction would
 only hide the behavior callers need to understand.
+
+### System-wide capture uses WinDivert by default
+
+Normal `reqtree start` opens WinDivert's signed WFP driver and redirects local IPv4 TCP ports 80
+and 443 into a Titanium transparent endpoint. Requests still enter the normal capture pipeline, so
+rules, scripts, limits, logs, and MCP queries do not gain a second interpretation path. ReqTree's
+own upstream sockets are excluded by consulting Windows' TCP owner table, preventing recursion.
+
+Opening the packet driver requires ReqTree to remain elevated for the whole run. A one-time UAC
+prompt would require installing and coordinating with a persistent privileged service,
+contradicting the one-process/no-service architecture. `--no-system-proxy` is the manual-client
+mode and disables both WFP redirection and the Windows proxy change. The first implementation passes
+IPv6, UDP, and QUIC untouched rather than partially parsing or breaking them. Closing either packet
+loop closes both WinDivert handles so a redirect failure fails open instead of cutting networking.

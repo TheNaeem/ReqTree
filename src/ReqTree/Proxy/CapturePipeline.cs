@@ -18,6 +18,9 @@ namespace ReqTree.Proxy;
 internal sealed class CapturePipeline
 {
     private const int MaxBodyBytes = 1024 * 1024;
+    private const int MaxWebSocketFrameBytes = 1024 * 1024;
+    private const int MaxWebSocketFramesPerExchange = 10_000;
+    private const long MaxWebSocketBytesPerExchange = 16L * 1024 * 1024;
     private static readonly string[] CapturedContentTypes =
     [
         "text/",
@@ -94,6 +97,11 @@ internal sealed class CapturePipeline
         };
 
         e.UserData = exchange;
+
+        // Titanium decides whether to expose decoded frames before it forwards the upgrade. The
+        // subscription therefore has to happen on the request hook, before we know whether the
+        // response will be 101. For ordinary HTTP requests this event is simply never raised.
+        e.BeforeWebSocketFrame += OnBeforeWebSocketFrameAsync;
 
         if (request.HasBody && ShouldCaptureExchange(request.ContentType, request.ContentLength))
         {
@@ -182,6 +190,7 @@ internal sealed class CapturePipeline
         var response = e.HttpClient.Response;
         exchange.CompletedAt = DateTimeOffset.Now;
         exchange.StatusCode = response.StatusCode;
+        exchange.ResponseHttpVersion = response.HttpVersion.ToString();
         exchange.ResponseHeaders = ReadHeaders(response.Headers);
         exchange.ResponseContentType = response.ContentType;
         exchange.ResponseSizeBytes = response.ContentLength > 0 ? response.ContentLength : 0;
@@ -252,6 +261,50 @@ internal sealed class CapturePipeline
         }
 
         _exchangeCompleted(exchange);
+    }
+
+    private Task OnBeforeWebSocketFrameAsync(object sender, WebSocketFrameInterceptEventArgs frame)
+    {
+        var session = frame.Session;
+        if (!_captureEnabled || session.UserData is not Exchange exchange)
+            return Task.CompletedTask;
+
+        // If the handshake exchange has already fallen out of the bounded store, retaining frames
+        // on the live session would grow memory that no read tool can ever reach.
+        if (_capture.GetById(exchange.Id) is null)
+            return Task.CompletedTask;
+
+        var source = frame.Data;
+        var truncated = source.Length > MaxWebSocketFrameBytes;
+        var data = truncated ? source[..MaxWebSocketFrameBytes] : [.. source];
+
+        var captured = new CapturedWebSocketFrame(
+            DateTimeOffset.Now,
+            frame.Direction is Titanium.Web.Proxy.EventArguments.WebSocketFrameDirection.ClientToServer
+                ? Objects.WebSocketFrameDirection.ClientToServer
+                : Objects.WebSocketFrameDirection.ServerToClient,
+            frame.OpCode.ToString(),
+            frame.IsFinal,
+            data,
+            truncated);
+
+        if (exchange.AddWebSocketFrame(
+                captured, MaxWebSocketFramesPerExchange, MaxWebSocketBytesPerExchange))
+        {
+            // Add a snapshot rather than the live object. The two relay directions can append at
+            // once, and the store's remembered byte charge must advance with every retained frame.
+            _capture.UpdateExisting(ExchangeSnapshot.CopyOf(exchange));
+        }
+        else if (exchange.WebSocketFramesOmitted == 1)
+        {
+            Log.Warning(
+                "WebSocket exchange {Id} reached its per-socket capture cap ({Frames} frames or "
+                + "{Megabytes} MB). Further frames still pass through but are not retained.",
+                exchange.Id, MaxWebSocketFramesPerExchange,
+                MaxWebSocketBytesPerExchange / 1024 / 1024);
+        }
+
+        return Task.CompletedTask;
     }
 
     private void CheckCaptureWindow(Exchange exchange)

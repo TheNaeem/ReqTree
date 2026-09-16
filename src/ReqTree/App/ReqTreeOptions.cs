@@ -19,7 +19,7 @@ public class ReqTreeOptions
     private Dictionary<string, string> _values;
 
     /// <summary>The verb, taken from the first argument.</summary>
-    public ReqTreeCommand Command { get; private set;}
+    public ReqTreeCommand Command { get; private set; }
 
     /// <summary>The dump file to read, when the command is <see cref="ReqTreeCommand.Open"/>.</summary>
     public string? OpenFile { get; private set; }
@@ -29,6 +29,9 @@ public class ReqTreeOptions
 
     /// <summary>Port the MCP HTTP server listens on.</summary>
     public int McpPort => IntValue("--mcp-port", fallback: 9999);
+
+    /// <summary>Port the transparent listener used by normal system-wide capture.</summary>
+    public int NetworkPort => IntValue("--network-port", fallback: 8889);
 
     /// <summary>When true, print a live one-line-per-request log to the console.</summary>
     public bool ConsoleView => _options.Contains("--console-view");
@@ -41,8 +44,8 @@ public class ReqTreeOptions
     public bool NoProxy => _options.Contains("--no-proxy");
 
     /// <summary>
-    /// When true, leave the machine's proxy settings alone and only listen on the port. Clients
-    /// must then be pointed at that port themselves.
+    /// When true, leave both the machine's proxy settings and network traffic alone. ReqTree only
+    /// listens on its explicit port, and clients must be pointed there themselves.
     /// </summary>
     public bool NoSystemProxy => _options.Contains("--no-system-proxy");
 
@@ -51,6 +54,16 @@ public class ReqTreeOptions
     /// trust store.
     /// </summary>
     public bool NoCertificateTrust => _options.Contains("--no-cert-trust");
+
+    /// <summary>
+    /// When true, trust ReqTree's root in the local-machine store. This is the default; Titanium
+    /// requests elevation for the certificate operation without requiring ReqTree itself to run
+    /// elevated. Use --user-cert-trust to limit trust to the current account.
+    /// </summary>
+    public bool MachineCertificateTrust => !NoCertificateTrust && !UserCertificateTrust;
+
+    /// <summary>When true, trust ReqTree's root only for the current Windows account.</summary>
+    public bool UserCertificateTrust => _options.Contains("--user-cert-trust");
 
     /// <summary>
     /// When true, run with recording paused: traffic is proxied but nothing is recorded until
@@ -159,7 +172,33 @@ public class ReqTreeOptions
             return false;
         }
 
-        foreach (var (flag, value) in new[] { ("--port", ProxyPort), ("--mcp-port", McpPort) })
+        if (!NoSystemProxy && (NetworkPort == ProxyPort || NetworkPort == McpPort))
+        {
+            Log.Error(
+                "--network-port ({NetworkPort}) must differ from --port ({ProxyPort}) and "
+                + "--mcp-port ({McpPort}).", NetworkPort, ProxyPort, McpPort);
+            return false;
+        }
+
+        var explicitMachineTrust = _options.Contains("--machine-cert-trust");
+        if (NoCertificateTrust && (explicitMachineTrust || UserCertificateTrust))
+        {
+            Log.Error("--no-cert-trust cannot be combined with a certificate-trust option.");
+            return false;
+        }
+
+        if (explicitMachineTrust && UserCertificateTrust)
+        {
+            Log.Error("--machine-cert-trust and --user-cert-trust contradict each other. Pick one.");
+            return false;
+        }
+
+        foreach (var (flag, value) in new[]
+                 {
+                     ("--port", ProxyPort),
+                     ("--mcp-port", McpPort),
+                     ("--network-port", NetworkPort),
+                 })
             if (value is < 1 or > 65535)
             {
                 Log.Error("{Flag} must be a port between 1 and 65535, but got {Value}.", flag, value);
@@ -171,6 +210,7 @@ public class ReqTreeOptions
         // worth saying, not a fallback worth guessing at.
         if (!ValidateNumber("--port", 1, 65535)
             | !ValidateNumber("--mcp-port", 1, 65535)
+            | !ValidateNumber("--network-port", 1, 65535)
             | !ValidateNumber("--buffer", 0, int.MaxValue)
             | !ValidateNumber("--buffer-mb", 0, int.MaxValue)
             | !ValidateNumber("--stop-after", 0, int.MaxValue))
@@ -222,23 +262,25 @@ public class ReqTreeOptions
     /// </remarks>
     public static string HelpText =>
         """
-        ReqTree - system-wide HTTP/HTTPS capture proxy driven by an LLM over MCP.
+        ReqTree - HTTP/1.x, HTTP/2 and WebSocket capture proxy driven by an LLM over MCP.
 
         It intercepts traffic, holds it in memory, and exposes it through MCP tools. You start it
         from a terminal; the analysis happens in whatever LLM connects to it.
 
         WHICH MODE DO YOU WANT?
 
-          Capture everything this machine does (the usual one):
-              reqtree start
-          Points the machine's proxy settings at ReqTree and trusts its root certificate, so every
-          browser and app goes through it. Stop with Ctrl+C - that is what puts the settings back.
+          Capture system-wide HTTP/HTTPS traffic (the usual one):
+              Run an Administrator terminal, then: reqtree start
+          Captures local IPv4 HTTP/HTTPS below the system-proxy layer as well as pointing the
+          Windows proxy settings at ReqTree. This reaches browsers and apps that ignore those
+          settings. ReqTree must remain elevated while it runs. Stop with Ctrl+C - that puts the
+          proxy settings back and closes the network redirect.
 
           Capture one program, without touching the machine:
               reqtree start --no-system-proxy --no-cert-trust
           Only listens. Point the client at it yourself, e.g. curl -x http://localhost:8888, and
           trust %LOCALAPPDATA%\ReqTree\reqtree-root.cer if it needs HTTPS. Nothing machine-wide
-          changes, and there is no certificate prompt.
+          changes, there is no network redirect, and there is no certificate prompt.
 
           Connect an LLM now, decide what to record later:
               reqtree start --no-proxy
@@ -253,14 +295,18 @@ public class ReqTreeOptions
 
           --port=<n>         Port the capture proxy listens on    (default 8888)
           --mcp-port=<n>     Port the MCP HTTP server listens on  (default 9999)
+          --network-port=<n> Internal transparent-listener port   (default 8889)
           --console-view     Print a live one-line log of captured traffic
           --paused           Proxy traffic but do not record it until start_capture is called
           --buffer=<n>       Exchanges held in memory             (default 5000, 0 = unlimited)
           --buffer-mb=<n>    Approximate body memory ceiling, MB  (default 512, 0 = unlimited)
           --stop-after=<n>   Stop recording after n exchanges     (default: no limit)
           --no-proxy         Start the MCP server only; leave the capture proxy stopped
-          --no-system-proxy  Listen only; do not touch the machine's proxy settings
-          --no-cert-trust    Do not install the root certificate into the trust store
+          --no-system-proxy  Manual-client mode; do not redirect machine traffic or change settings
+          --no-cert-trust    Do not install the root certificate into any trust store
+          --user-cert-trust  Trust the root only for the current account; no elevation required
+          --machine-cert-trust
+                              Compatibility alias; machine-wide trust is already the default
           -h, --help         Show this help
 
         CONNECTING AN MCP CLIENT
@@ -280,6 +326,15 @@ public class ReqTreeOptions
 
           Captured traffic lives in memory and reaches disk only when save_capture is called. It is
           lost when this process exits unless somebody saved it.
+
+          By default ReqTree installs its own CA into both the Current User and Local Machine
+          trusted-root stores. The CA stays trusted until removed explicitly. In manual-client
+          mode Windows may request elevation for that certificate operation alone. Use
+          --user-cert-trust to limit trust, or --no-cert-trust to install neither.
+
+          Normal system-wide capture uses a WFP-backed redirect and therefore requires ReqTree to
+          run as administrator. It covers IPv4 TCP ports 80 and 443. IPv6, UDP and QUIC continue
+          normally and are not captured. --no-system-proxy disables this redirect too.
 
           If ReqTree is killed rather than stopped, the machine's proxy settings are left pointing
           at it and the internet appears to stop working. Run reqtree start again - it detects that

@@ -138,8 +138,9 @@ internal sealed record ScriptProbeResult(bool TimedOut, string? Error, string? R
 /// <summary>Copies exchanges across the boundary between proxy work and isolated script work.</summary>
 internal static class ExchangeSnapshot
 {
-    internal static Exchange CopyOf(Exchange source) =>
-        new()
+    internal static Exchange CopyOf(Exchange source)
+    {
+        var copy = new Exchange
         {
             Id = source.Id,
             StartedAt = source.StartedAt,
@@ -155,6 +156,7 @@ internal static class ExchangeSnapshot
             RequestBodyTruncated = source.RequestBodyTruncated,
             StatusCode = source.StatusCode,
             CompletedAt = source.CompletedAt,
+            ResponseHttpVersion = source.ResponseHttpVersion,
             ResponseHeaders = source.ResponseHeaders is { } responseHeaders
                 ? [.. responseHeaders]
                 : null,
@@ -163,6 +165,13 @@ internal static class ExchangeSnapshot
             ResponseBodyTruncated = source.ResponseBodyTruncated,
             ResponseSizeBytes = source.ResponseSizeBytes,
         };
+
+        foreach (var frame in source.WebSocketFrames)
+            copy.AddWebSocketFrame(frame with { Data = [.. frame.Data] });
+
+        copy.WebSocketFramesOmitted = source.WebSocketFramesOmitted;
+        return copy;
+    }
 
     internal static void CopyMutableState(Exchange source, Exchange target)
     {
@@ -173,6 +182,7 @@ internal static class ExchangeSnapshot
         target.RequestBodyTruncated = source.RequestBodyTruncated;
         target.StatusCode = source.StatusCode;
         target.CompletedAt = source.CompletedAt;
+        target.ResponseHttpVersion = source.ResponseHttpVersion;
         target.ResponseHeaders = source.ResponseHeaders is { } responseHeaders
             ? [.. responseHeaders]
             : null;
